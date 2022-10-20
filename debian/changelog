@@ -1,0 +1,436 @@
+xdg-desktop-portal (1.10.1-4) unstable; urgency=medium
+
+  * Upload to unstable.
+    The libportal-based build-time test coverage passes on all release
+    architectures.
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 16 Nov 2021 10:30:39 +0000
+
+xdg-desktop-portal (1.10.1-3) experimental; urgency=medium
+
+  * d/gbp.conf: Branch for experimental
+  * d/control, d/rules: Enable libportal now that it is available in testing
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 15 Nov 2021 20:37:48 +0000
+
+xdg-desktop-portal (1.10.1-2) unstable; urgency=medium
+
+  * d/p/open-uri-Avoid-calling-into-o.fd.FileManager1-during-star.patch:
+    Add proposed patch to resolve deadlock with some file managers.
+    This avoids a long delay during startup of GtkApplication-based
+    implementations of the o.fd.FileManager1 interface, such as XFCE's
+    Thunar, in a non-GNOME and non-XFCE environment. (Closes: #994865)
+  * d/p/build-Fix-cross-compilation-by-adjusting-pkg-config-use.patch:
+    Add proposed patch to fix cross-compilation.
+    Thanks to Helmut Grohne (Closes: #985411)
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 01 Oct 2021 23:29:32 +0100
+
+xdg-desktop-portal (1.10.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * Standards-Version: 4.6.0 (no changes required)
+  * d/rules: Stop working around wrong permissions on test-document-fuse.py.
+    This was fixed upstream.
+  * Don't let debhelper 13 make installed-tests data executable
+  * Use debhelper compat level 13
+    - No need to override dh_missing any more
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 21 Sep 2021 17:21:24 +0100
+
+xdg-desktop-portal (1.8.1-1) unstable; urgency=medium
+
+  * New upstream release
+    - Fix a fd leak when opening URIs
+    - Fix directory support in filechooser
+    - Improve Snap support
+    - Fix a crash when setting wallpaper fails
+  * Drop fontconfig build-dependency, no longer needed
+  * Define _GNU_SOURCE when compiling the icon validator,
+    avoiding an implicit declaration of execvpe()
+  * Label the icon validator as coming from Flatpak 1.10.1
+    (no actual changes, the code is identical to 1.8.1)
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 19 Feb 2021 10:21:45 +0000
+
+xdg-desktop-portal (1.8.0-3) unstable; urgency=medium
+
+  * debian/rules: Build with pipewire support in ubuntu as well (LP: #1879580)
+
+ -- Marco Trevisan (Treviño) <marco@ubuntu.com>  Thu, 11 Feb 2021 19:08:03 +0100
+
+xdg-desktop-portal (1.8.0-2) unstable; urgency=medium
+
+  * Version the build-dependency on libflatpak-dev.
+    This is significant when backporting to buster.
+  * Preferentially build-depend on libgdk-pixbuf-2.0-dev.
+    We don't need the deprecated Xlib integration that is also pulled in
+    by the older libgdk-pixbuf2.0-dev package (see #974870).
+  * Standards-Version: 4.5.1 (no changes required)
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 24 Nov 2020 12:01:38 +0000
+
+xdg-desktop-portal (1.8.0-1) unstable; urgency=medium
+
+  * New upstream release
+    - Drop most patches, applied upstream
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 16 Sep 2020 10:31:24 +0100
+
+xdg-desktop-portal (1.7.2-2) unstable; urgency=medium
+
+  * d/rules: Don't explicitly use --as-needed linker option.
+    It's the default with bullseye toolchains.
+  * Release to unstable as part of the pipewire 0.3 transition
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 10 Sep 2020 12:32:17 +0100
+
+xdg-desktop-portal (1.7.2-1) experimental; urgency=medium
+
+  * New upstream development release
+  * Drop patch skipping FUSE tests if necessary,
+    upstream made an equivalent change
+  * Update icon validator to the one from Flatpak 1.8.1
+  * Build-Depend on libcap2-bin, for capsh, and add it to test dependencies
+  * tests: Look for capsh in /sbin
+  * Update patches.
+    This includes upstream 1.7.2-37-g089e72b plus merge request
+    <https://github.com/flatpak/xdg-desktop-portal/pull/521>,
+    to make the installed-tests work better.
+  * d/tests/gnome-desktop-testing: Set TEST_IN_CI.
+    Upstream uses this to extend test timeouts and skip flaky tests.
+  * Re-enable pipewire now that 0.3.x is in experimental
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 07 Sep 2020 19:41:23 +0100
+
+xdg-desktop-portal (1.7.1-1) experimental; urgency=medium
+
+  * New upstream development release
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 30 Mar 2020 10:19:22 +0100
+
+xdg-desktop-portal (1.7.0-1) experimental; urgency=medium
+
+  * Switch to experimental branch
+    - d/watch: Watch for development releases
+    - d/gbp.conf, d/control: Use debian/experimental packaging branch
+    - d/gbp.conf: Use upstream/latest branch
+  * New upstream development release
+  * Disable pipewire until 0.3.x is available (#954022)
+  * Drop patches that were applied upstream
+  * Set upstream metadata fields: Repository.
+  * Remove obsolete field Name from debian/upstream/metadata (already
+    present in machine-readable debian/copyright).
+  * Standards-Version: 4.5.0 (no changes required)
+  * d/p/tests-Divert-service-stdout-to-stderr.patch: Simplify
+  * tests: Depend on procps, for /bin/kill
+  * tests: Depend on python3 and python3-gi
+  * Add a patch to skip (more) FUSE tests on buildds
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 25 Mar 2020 16:00:52 +0000
+
+xdg-desktop-portal (1.6.0-1) unstable; urgency=medium
+
+  * New upstream stable release
+    - d/watch: Only watch for stable releases
+    - d/gbp.conf: Use debian/master, upstream/1.6.x branches
+  * Mention #946913 in previous changelog entry
+  * Add "unsafe" pkg.libportal.enable build option to enable extra tests
+    while libportal is not yet API-stable
+  * d/p/Fix-the-build-on-old-glib.patch,
+    d/p/xml-Avoid-fancy-quotes.patch:
+    Add post-release fixes from upstream
+  * d/p/open-uri-Fix-criticals-if-no-default-handler-for-desired-.patch,
+    d/p/tests-Fix-race-condition-in-various-Lockdown-tests.patch,
+    d/p/tests-Skip-Location-tests-if-we-have-no-D-Bus-system-bus.patch,
+    d/p/tests-Install-test-backends.patch,
+    d/p/tests-When-installed-look-for-executables-in-libexecdir.patch,
+    d/p/tests-Install-test.portal-for-installed-tests.patch:
+    Fix some test failures when libportal is enabled
+  * d/p/tests-Divert-service-stdout-to-stderr.patch,
+    d/p/tests-Always-produce-verbose-output-from-subprocesses.patch:
+    Improve test diagnostics
+  * d/p/Replace-the-icon-validator-with-the-one-from-Flatpak-1.6..patch:
+    Relabel the icon validator as coming from Flatpak 1.6.0
+    (it's the same as 1.4.2)
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 24 Dec 2019 14:15:27 +0000
+
+xdg-desktop-portal (1.5.4-1) experimental; urgency=medium
+
+  * Branch for experimental
+  * New upstream development release
+    - d/patches: Rebase
+    - d/rules: Explicitly disable libportal-based tests (ITP: #946605)
+    - Only log one warning if unable to track which apps are "in the
+      background, for example x-d-p-gtk in a non-GNOME environment
+      (Closes: #946913)
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 13 Dec 2019 23:23:14 +0000
+
+xdg-desktop-portal (1.4.2-3) unstable; urgency=medium
+
+  * Standards-Version: 4.4.1 (no changes required)
+  * Re-enable pipewire (screen recording) support now that v0.2.7 is
+    available
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 02 Nov 2019 10:12:41 +0000
+
+xdg-desktop-portal (1.4.2-2) unstable; urgency=medium
+
+  * Release to unstable
+  * d/salsa-ci.yml: Request standard CI on salsa.debian.org
+  * d/p/test-doc-portal-Check-for-FUSE-support-more-thoroughly.patch:
+    Skip tests when FUSE is non-functional, even if we are root
+  * Standards-Version: 4.4.0 (no changes required)
+  * Use debhelper-compat 12
+    - Remove redundant --libexecdir=/usr/libexec, which is the default
+      at this compat level
+  * d/p/Replace-the-icon-validator-with-the-one-from-Flatpak-1.4..patch:
+    Update icon validator to the one from Flatpak 1.4.2
+  * Mark autopkgtest as flaky due to #931726
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 16 Jul 2019 09:19:47 +0100
+
+xdg-desktop-portal (1.4.2-1) experimental; urgency=medium
+
+  * New upstream release
+  * Disable pipewire (screencasting) until 0.2.6 is available in Debian
+  * Build-depend on libjson-glib-dev
+  * d/copyright: Update
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 10 Jun 2019 09:37:22 +0100
+
+xdg-desktop-portal (1.2.0-1) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * New upstream stable release
+  * d/watch: Only watch for stable releases
+  * d/p/Revert-Stop-building-the-icon-validator.patch,
+    d/p/validate-icon-Add-a-define-for-bwrap.patch,
+    d/p/Replace-the-icon-validator-with-the-one-from-Flatpak-git-.patch:
+    Build a copy of the icon validator from Flatpak git master.
+    We don't want to rely on a version of Flatpak that isn't
+    stable yet.
+    - d/p/notification-Handle-non-existing-directories.patch,
+      d/p/notification-bind-mount-etc-ld.so.cache-to-the-sandbox.patch:
+      Remove, no longer necessary
+  * d/upstream/metadata: Add DEP-12 metadata
+  * Release to unstable
+
+  [ Jeremy Bicha ]
+  * Don't enable remote desktop support on Ubuntu. See LP bug 1802533
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 26 Jan 2019 18:31:50 +0000
+
+xdg-desktop-portal (1.1.1-1) experimental; urgency=medium
+
+  * New upstream development release
+    - Drop patches, applied upstream
+    - Build-Depend on libgdk-pixbuf2.0-dev, for icon validation
+    - Package new xdg-desktop-portal-validate-icon executable
+    - Depend on bubblewrap, for sandboxed icon validation
+  * Enable Location portal (geoclue-2.0)
+  * Standards-Version: 4.3.0 (no changes required)
+  * d/control: Set Vcs-Git branch for experimental
+  * d/p/notification-Handle-non-existing-directories.patch,
+    d/p/notification-bind-mount-etc-ld.so.cache-to-the-sandbox.patch:
+    Make bwrap invocation more reliable, and in particular make it
+    work on purely 32-bit systems with no /lib64 (patches taken from
+    gnome-desktop, thanks to Iain Lane and Mart Raudsepp)
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 17 Jan 2019 09:57:59 +0000
+
+xdg-desktop-portal (1.1.0-1) experimental; urgency=medium
+
+  * New upstream development release
+    - d/copyright: Update
+    - d/control: Build-depend on fontconfig, for fontconfig cache
+      invalidation in Settings portal
+    - d/control: Build-depend on flatpak, for permission-store test
+  * Don't build with Location portal yet, because geoclue-2.0 is
+    currently too old
+  * Drop patch, applied upstream
+  * d/gbp.conf: Use debian/experimental branch
+  * d/patches: Skip another build-time test when FUSE is not supported
+  * d/patches: Don't show a critical warning when a document permissions
+    entry is removed
+  * Enable Pipewire support, for screencasting
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 19 Nov 2018 18:47:57 +0000
+
+xdg-desktop-portal (1.0.3-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/p/desktop-portal-don-t-attempt-to-export-NULL-GDBusInterfac.patch:
+    Add patch from upstream to guard against NULL interface objects
+    (previously applied in Ubuntu, LP: #1691649)
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 13 Oct 2018 11:33:35 +0100
+
+xdg-desktop-portal (1.0.2-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/p/network-monitor-Build-variants-for-GetStatus-correctly.patch:
+    Drop, superseded by upstream changes
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 10 Sep 2018 10:37:46 +0100
+
+xdg-desktop-portal (1.0.1-1) unstable; urgency=medium
+
+  * New upstream release
+  * d/p/network-monitor-Build-variants-for-GetStatus-correctly.patch:
+    Add patch to make NetworkMonitor.GetStatus() work as intended
+  * Standards-Version: 4.2.1 (no changes required)
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 31 Aug 2018 08:55:19 +0100
+
+xdg-desktop-portal (1.0-1) unstable; urgency=medium
+
+  * New upstream release
+  * Install upstream NEWS
+  * Standards-Version: 4.2.0 (no further changes)
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 23 Aug 2018 09:53:13 +0100
+
+xdg-desktop-portal (0.99-1) unstable; urgency=medium
+
+  * New upstream release
+  * Standards-Version: 4.1.5
+  * Install to /usr/libexec
+  * Build in a UTF-8 locale, to avoid FTBFS when gdbus-codegen reads
+    UTF-8
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 28 Jul 2018 12:28:48 +0100
+
+xdg-desktop-portal (0.11-2) unstable; urgency=medium
+
+  [ Jeremy Bicha ]
+  * Update package description to mention Snap
+  * Use github page as homepage
+
+ -- Simon McVittie <smcv@debian.org>  Sun, 24 Jun 2018 22:02:48 +0100
+
+xdg-desktop-portal (0.11-1) unstable; urgency=medium
+
+  * New upstream release
+    - Drop patch, applied upstream
+  * Standards-Version: 4.1.4 (no changes)
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 25 Apr 2018 16:29:22 +0100
+
+xdg-desktop-portal (0.10-4) unstable; urgency=medium
+
+  * Merge from experimental, with autopkgtests included
+  * d/p/build-Run-install-test-data-hook-as-intended.patch:
+    Mark patch as applied upstream
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 16 Feb 2018 14:50:44 +0000
+
+xdg-desktop-portal (0.10-3) experimental; urgency=medium
+
+  * Reinstate xdg-desktop-portal-tests package and autopkgtests
+  * d/p/build-Run-install-test-data-hook-as-intended.patch:
+    Run the tests' install hook to set up enough symlinks that they
+    will pass
+  * Upload to experimental to wait for NEW processing
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 15 Feb 2018 00:30:01 +0000
+
+xdg-desktop-portal (0.10-2) unstable; urgency=medium
+
+  * Really remove xdg-desktop-portal-tests stanza from d/control
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 15 Feb 2018 00:01:42 +0000
+
+xdg-desktop-portal (0.10-1) unstable; urgency=medium
+
+  * New upstream release
+  * Add Breaks/Replaces for flatpak (<< 0.10.4-1~) since this package
+    has taken over the permission store and documents portal
+  * Disable Pipewire support for now (ITP: #874089)
+  * Add new build-dependencies for FUSE
+  * Install the permission store and documents portal
+  * d/copyright: Update
+  * Drop flatpak build-dependency, no longer needed
+  * Remove patches, applied upstream
+  * Depend on FUSE
+  * Build installed-tests, but don't install them for now to avoid the
+    NEW queue
+  * Use dh_missing --fail-missing instead of dh_install --fail-missing
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 14 Feb 2018 17:44:15 +0000
+
+xdg-desktop-portal (0.9-2) unstable; urgency=medium
+
+  * Standards-Version: 4.1.3 (no changes)
+  * Change Vcs-* to point to salsa.debian.org
+  * d/p/0.10/: Update to upstream git commit 0.9-9-g422ecf3 for various
+    bug fixes
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 18 Jan 2018 08:46:29 +0000
+
+xdg-desktop-portal (0.9-1) unstable; urgency=medium
+
+  * New upstream release
+    - Drop all patches, applied upstream
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 24 Nov 2017 10:38:16 +0000
+
+xdg-desktop-portal (0.8-3) unstable; urgency=medium
+
+  * Set Rules-Requires-Root to no
+  * Use https Format URL in d/copyright
+  * Standards-Version: 4.1.1 (no further changes)
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 11 Nov 2017 13:43:41 +0000
+
+xdg-desktop-portal (0.8-2) unstable; urgency=medium
+
+  * Mark patches as applied upstream for 0.9
+  * Upload to unstable
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 10 Jun 2017 10:12:20 +0100
+
+xdg-desktop-portal (0.8-1) experimental; urgency=medium
+
+  * New upstream release
+  * Add patches to make the development files completely
+    architecture-independent (Closes: #864451)
+  * Make xdg-desktop-portal-dev Architecture: all
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 09 Jun 2017 08:04:12 +0100
+
+xdg-desktop-portal (0.6-1) experimental; urgency=medium
+
+  * New upstream release
+    - Run as a systemd user service if dbus-user-session is installed
+    - Add email portal
+  * Move to debhelper compat level 10
+  * Omit unimplemented configure option --enable-installed-tests
+  * Do not explicitly disable quiet Automake output: dh now does this
+    by default
+  * Move API documentation from main package to -dev package
+  * Register API documentation with doc-base
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 03 Apr 2017 15:28:02 +0100
+
+xdg-desktop-portal (0.5-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 21 Jan 2017 16:28:36 +0000
+
+xdg-desktop-portal (0.4-1) unstable; urgency=medium
+
+  * New upstream release
+    - Drop cherry-picked patch for flatpak 0.6.10 container detection,
+      now included in the upstream release
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 05 Dec 2016 10:51:02 +0000
+
+xdg-desktop-portal (0.3-1) unstable; urgency=medium
+
+  * Initial release. (Closes: #831689)
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 21 Sep 2016 22:14:13 +0100
