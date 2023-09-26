@@ -4,9 +4,10 @@
 
 #include <gio/gio.h>
 
-#include "src/xdp-dbus.h"
-#include "src/xdp-utils.h"
-#include "src/xdp-impl-dbus.h"
+#include "src/glib-backports.h"
+#include "xdp-dbus.h"
+#include "xdp-utils.h"
+#include "xdp-impl-dbus.h"
 
 #ifdef HAVE_LIBPORTAL
 #include "account.h"
@@ -24,6 +25,18 @@
 #include "wallpaper.h"
 #endif
 
+#include "utils.h"
+
+/* required while we support meson + autotools. Autotools builds everything in
+   the root dir ('.'), meson builds in each subdir nested and overrides these for
+   g_test_build_filename */
+#ifndef XDG_DP_BUILDDIR
+#define XDG_DP_BUILDDIR "."
+#endif
+#ifndef XDG_PS_BUILDDIR
+#define XDG_PS_BUILDDIR "."
+#endif
+
 #define PORTAL_BUS_NAME "org.freedesktop.portal.Desktop"
 #define PORTAL_OBJECT_PATH "/org/freedesktop/portal/desktop"
 #define BACKEND_BUS_NAME "org.freedesktop.impl.portal.Test"
@@ -35,10 +48,9 @@ char outdir[] = "/tmp/xdp-test-XXXXXX";
 
 static GTestDBus *dbus;
 static GDBusConnection *session_bus;
-static GSubprocess *portals;
-static GSubprocess *backends;
-XdpImplPermissionStore *permission_store;
-XdpImplLockdown *lockdown;
+static GList *test_procs = NULL;
+XdpDbusImplPermissionStore *permission_store;
+XdpDbusImplLockdown *lockdown;
 
 int
 xdup (int oldfd)
@@ -126,6 +138,7 @@ global_setup (void)
   g_autofree gchar *portal_dir = NULL;
   g_autofree gchar *argv0 = NULL;
   g_autoptr(GSubprocessLauncher) launcher = NULL;
+  g_autoptr(GSubprocess) subprocess = NULL;
   guint name_timeout;
   const char *argv[4];
   GQuark portal_errors G_GNUC_UNUSED;
@@ -136,10 +149,14 @@ global_setup (void)
   update_data_dirs ();
 
   g_mkdtemp (outdir);
-  g_print ("outdir: %s\n", outdir);
+  g_debug ("outdir: %s\n", outdir);
 
+  g_setenv ("XDG_CURRENT_DESKTOP", "test", TRUE);
   g_setenv ("XDG_RUNTIME_DIR", outdir, TRUE);
   g_setenv ("XDG_DATA_HOME", outdir, TRUE);
+
+  /* Re-defining dbus-daemon with a custom script */
+  setup_dbus_daemon_wrapper (outdir);
 
   dbus = g_test_dbus_new (G_TEST_DBUS_NONE);
   services = g_test_build_filename (G_TEST_BUILT, "services", NULL);
@@ -174,59 +191,19 @@ global_setup (void)
 
   backends_executable = g_test_build_filename (G_TEST_BUILT, "test-backends", NULL);
   argv[0] = backends_executable;
-  argv[1] = g_test_verbose () ? "--verbose" : NULL;
-  argv[2] = NULL;
+  argv[1] = "--backend-name=" BACKEND_BUS_NAME;
+  argv[2] = g_test_verbose () ? "--verbose" : NULL;
+  argv[3] = NULL;
 
-  g_print ("launching test-backend\n");
+  g_debug ("launching test-backend\n");
 
-  backends = g_subprocess_launcher_spawnv (launcher, argv, &error);
+  subprocess = g_subprocess_launcher_spawnv (launcher, argv, &error);
   g_assert_no_error (error);
+  g_test_message ("Launched %s with pid %s\n", argv[0],
+                  g_subprocess_get_identifier (subprocess));
+  test_procs = g_list_append (test_procs, g_steal_pointer (&subprocess));
 
   name_timeout = g_timeout_add (1000 * timeout_mult, timeout_cb, "Failed to launch test-backends");
-
-  while (!name_appeared)
-    g_main_context_iteration (NULL, TRUE);
-
-  g_source_remove (name_timeout);
-  g_bus_unwatch_name (watch);
-
-  /* start portals */
-  name_appeared = FALSE;
-  watch = g_bus_watch_name_on_connection (session_bus,
-                                          PORTAL_BUS_NAME,
-                                          0,
-                                          name_appeared_cb,
-                                          name_disappeared_cb,
-                                          &name_appeared,
-                                          NULL);
-
-  portal_dir = g_test_build_filename (G_TEST_DIST, "portals", NULL);
-
-  g_clear_object (&launcher);
-  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
-  g_subprocess_launcher_setenv (launcher, "G_DEBUG", "fatal-criticals", TRUE);
-  g_subprocess_launcher_setenv (launcher, "DBUS_SESSION_BUS_ADDRESS", g_test_dbus_get_bus_address (dbus), TRUE);
-  g_subprocess_launcher_setenv (launcher, "XDG_DESKTOP_PORTAL_DIR", portal_dir, TRUE);
-  g_subprocess_launcher_setenv (launcher, "XDG_DATA_HOME", outdir, TRUE);
-  g_subprocess_launcher_setenv (launcher, "PATH", g_getenv ("PATH"), TRUE);
-  g_subprocess_launcher_take_stdout_fd (launcher, xdup (STDERR_FILENO));
-
-  if (g_getenv ("XDP_UNINSTALLED") != NULL)
-    argv0 = g_test_build_filename (G_TEST_BUILT, "..", "xdg-desktop-portal", NULL);
-  else
-    argv0 = g_strdup (LIBEXECDIR "/xdg-desktop-portal");
-
-  argv[0] = argv0;
-  argv[1] = g_test_verbose () ? "--verbose" : NULL;
-  argv[2] = NULL;
-
-  g_print ("launching %s\n", argv0);
-
-  portals = g_subprocess_launcher_spawnv (launcher, argv, &error);
-  g_assert_no_error (error);
-  g_clear_pointer (&argv0, g_free);
-
-  name_timeout = g_timeout_add (1000 * timeout_mult, timeout_cb, "Failed to launch xdg-desktop-portal");
 
   while (!name_appeared)
     g_main_context_iteration (NULL, TRUE);
@@ -253,7 +230,7 @@ global_setup (void)
   g_subprocess_launcher_take_stdout_fd (launcher, xdup (STDERR_FILENO));
 
   if (g_getenv ("XDP_UNINSTALLED") != NULL)
-    argv0 = g_test_build_filename (G_TEST_BUILT, "..", "xdg-permission-store", NULL);
+    argv0 = g_test_build_filename (G_TEST_BUILT, "..", XDG_PS_BUILDDIR, "xdg-permission-store", NULL);
   else
     argv0 = g_strdup (LIBEXECDIR "/xdg-permission-store");
 
@@ -262,10 +239,13 @@ global_setup (void)
   argv[2] = g_test_verbose () ? "--verbose" : NULL;
   argv[3] = NULL;
 
-  g_print ("launching %s\n", argv0);
+  g_debug ("launching %s\n", argv0);
 
-  portals = g_subprocess_launcher_spawnv (launcher, argv, &error);
+  subprocess = g_subprocess_launcher_spawnv (launcher, argv, &error);
   g_assert_no_error (error);
+  g_test_message ("Launched %s with pid %s\n", argv[0],
+                  g_subprocess_get_identifier (subprocess));
+  test_procs = g_list_append (test_procs, g_steal_pointer (&subprocess));
 
   name_timeout = g_timeout_add (1000 * timeout_mult, timeout_cb, "Failed to launch xdg-permission-store");
 
@@ -275,24 +255,107 @@ global_setup (void)
   g_source_remove (name_timeout);
   g_bus_unwatch_name (watch);
 
-  permission_store = xdp_impl_permission_store_proxy_new_sync (session_bus,
-                                                               0,
-                                                               "org.freedesktop.impl.portal.PermissionStore",
-                                                               "/org/freedesktop/impl/portal/PermissionStore",
-                                                               NULL,
-                                                               &error);
+  /* start portals */
+  name_appeared = FALSE;
+  watch = g_bus_watch_name_on_connection (session_bus,
+                                          PORTAL_BUS_NAME,
+                                          0,
+                                          name_appeared_cb,
+                                          name_disappeared_cb,
+                                          &name_appeared,
+                                          NULL);
+
+  portal_dir = g_test_build_filename (G_TEST_BUILT, "portals", "test", NULL);
+
+  g_clear_object (&launcher);
+  launcher = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_NONE);
+  g_subprocess_launcher_setenv (launcher, "G_DEBUG", "fatal-criticals", TRUE);
+  g_subprocess_launcher_setenv (launcher, "DBUS_SESSION_BUS_ADDRESS", g_test_dbus_get_bus_address (dbus), TRUE);
+  g_subprocess_launcher_setenv (launcher, "XDG_DESKTOP_PORTAL_DIR", portal_dir, TRUE);
+  g_subprocess_launcher_setenv (launcher, "XDG_DATA_HOME", outdir, TRUE);
+  g_subprocess_launcher_setenv (launcher, "PATH", g_getenv ("PATH"), TRUE);
+  g_subprocess_launcher_take_stdout_fd (launcher, xdup (STDERR_FILENO));
+
+  if (g_getenv ("XDP_UNINSTALLED") != NULL)
+    argv0 = g_test_build_filename (G_TEST_BUILT, "..", XDG_DP_BUILDDIR, "xdg-desktop-portal", NULL);
+  else
+    argv0 = g_strdup (LIBEXECDIR "/xdg-desktop-portal");
+
+  argv[0] = argv0;
+  argv[1] = g_test_verbose () ? "--verbose" : NULL;
+  argv[2] = NULL;
+
+  g_debug ("launching %s\n", argv0);
+
+  subprocess = g_subprocess_launcher_spawnv (launcher, argv, &error);
+  g_assert_no_error (error);
+  g_test_message ("Launched %s with pid %s\n", argv[0],
+                  g_subprocess_get_identifier (subprocess));
+  test_procs = g_list_append (test_procs, g_steal_pointer (&subprocess));
+  g_clear_pointer (&argv0, g_free);
+
+  name_timeout = g_timeout_add (1000 * timeout_mult, timeout_cb, "Failed to launch xdg-desktop-portal");
+
+  while (!name_appeared)
+    g_main_context_iteration (NULL, TRUE);
+
+  g_source_remove (name_timeout);
+  g_bus_unwatch_name (watch);
+
+  permission_store = xdp_dbus_impl_permission_store_proxy_new_sync (session_bus,
+                                                                    0,
+                                                                    "org.freedesktop.impl.portal.PermissionStore",
+                                                                    "/org/freedesktop/impl/portal/PermissionStore",
+                                                                    NULL,
+                                                                    &error);
   g_assert_no_error (error);
 
-  lockdown = xdp_impl_lockdown_proxy_new_sync (session_bus,
-                                               0,
-                                               BACKEND_BUS_NAME,
-                                               BACKEND_OBJECT_PATH,
-                                               NULL,
-                                               &error);
+  lockdown = xdp_dbus_impl_lockdown_proxy_new_sync (session_bus,
+                                                    0,
+                                                    BACKEND_BUS_NAME,
+                                                    BACKEND_OBJECT_PATH,
+                                                    NULL,
+                                                    &error);
   g_assert_no_error (error);
 
   /* make sure errors are registered */
   portal_errors = XDG_DESKTOP_PORTAL_ERROR;
+}
+
+static void
+wait_for_test_procs (void)
+{
+  GList *l;
+
+  for (l = test_procs; l; l = l->next)
+    {
+      GSubprocess *subprocess = G_SUBPROCESS (l->data);
+      GError *error = NULL;
+      g_autofree char *identifier = NULL;
+
+      identifier = g_strdup (g_subprocess_get_identifier (subprocess));
+
+      g_debug ("Terminating and waiting for process %s", identifier);
+      g_subprocess_send_signal (subprocess, SIGTERM);
+
+      /* This may lead the test to hang, we assume that the test suite or CI
+       * can handle the case at upper level, without having us async function
+       * and timeouts */
+      g_subprocess_wait (subprocess, NULL, &error);
+      g_assert_no_error (error);
+      g_assert_null (g_subprocess_get_identifier (subprocess));
+
+      if (!g_subprocess_get_if_exited (subprocess))
+        {
+          g_assert_true (g_subprocess_get_if_signaled (subprocess));
+          g_assert_cmpint (g_subprocess_get_term_sig (subprocess), ==, SIGTERM);
+        }
+      else if (!g_subprocess_get_successful (subprocess))
+        {
+          g_error ("Subprocess %s, exited with exit status %d", identifier,
+                   g_subprocess_get_exit_status (subprocess));
+        }
+    }
 }
 
 static void
@@ -306,8 +369,8 @@ global_teardown (void)
   g_dbus_connection_close_sync (session_bus, NULL, &error);
   g_assert_no_error (error);
 
-  g_subprocess_force_exit (portals);
-  g_subprocess_force_exit (backends);
+  wait_for_test_procs ();
+  g_list_free_full (g_steal_pointer (&test_procs), g_object_unref);
 
   g_object_unref (lockdown);
   g_object_unref (permission_store);
@@ -318,21 +381,6 @@ global_teardown (void)
 
   g_object_unref (dbus);
 }
-
-/* Just check that the portal is there, and has the
- * expected version. This will fail if the backend
- * is not found.
- */
-#ifdef HAVE_PIPEWIRE
-#define check_pipewire(name)
-#else
-#define check_pipewire(name) \
- if (strcmp (name , "camera") == 0) \
-   { \
-     g_test_skip ("Skipping tests that require pipewire"); \
-     return; \
-   }
-#endif
 
 #ifdef HAVE_GEOCLUE
 #define check_geoclue(name)
@@ -345,6 +393,10 @@ global_teardown (void)
    }
 #endif
 
+/* Just check that the portal is there, and has the
+ * expected version. This will fail if the backend
+ * is not found.
+ */
 #define DEFINE_TEST_EXISTS(pp,PP,version) \
 static void \
 test_##pp##_exists (void) \
@@ -353,45 +405,47 @@ test_##pp##_exists (void) \
   g_autoptr(GError) error = NULL; \
   g_autofree char *owner = NULL; \
  \
- check_pipewire ( #pp ) \
  check_geoclue ( #pp ) \
  \
-  proxy = G_DBUS_PROXY (xdp_##pp##_proxy_new_sync (session_bus, \
-                                                   0, \
-                                                   PORTAL_BUS_NAME, \
-                                                   PORTAL_OBJECT_PATH, \
-                                                   NULL, \
-                                                   &error)); \
+  proxy = G_DBUS_PROXY (xdp_dbus_##pp##_proxy_new_sync (session_bus, \
+                                                        0, \
+                                                        PORTAL_BUS_NAME, \
+                                                        PORTAL_OBJECT_PATH, \
+                                                        NULL, \
+                                                        &error)); \
   g_assert_no_error (error); \
  \
   owner = g_dbus_proxy_get_name_owner (proxy); \
   g_assert_nonnull (owner); \
  \
-  g_assert_cmpuint (xdp_##pp##_get_version (XDP_##PP (proxy)), ==, version); \
+  g_assert_cmpuint (xdp_dbus_##pp##_get_version (XDP_DBUS_##PP (proxy)), ==, version); \
 }
 
 DEFINE_TEST_EXISTS(account, ACCOUNT, 1)
-DEFINE_TEST_EXISTS(background, BACKGROUND, 1)
+DEFINE_TEST_EXISTS(background, BACKGROUND, 2)
 DEFINE_TEST_EXISTS(camera, CAMERA, 1)
-DEFINE_TEST_EXISTS(email, EMAIL, 3)
+DEFINE_TEST_EXISTS(email, EMAIL, 4)
 DEFINE_TEST_EXISTS(file_chooser, FILE_CHOOSER, 3)
-DEFINE_TEST_EXISTS(game_mode, GAME_MODE, 3)
+DEFINE_TEST_EXISTS(game_mode, GAME_MODE, 4)
 DEFINE_TEST_EXISTS(inhibit, INHIBIT, 3)
 DEFINE_TEST_EXISTS(location, LOCATION, 1)
 DEFINE_TEST_EXISTS(network_monitor, NETWORK_MONITOR, 3)
 DEFINE_TEST_EXISTS(notification, NOTIFICATION, 1)
 DEFINE_TEST_EXISTS(open_uri, OPEN_URI, 3)
-DEFINE_TEST_EXISTS(print, PRINT, 1)
+DEFINE_TEST_EXISTS(print, PRINT, 2)
 DEFINE_TEST_EXISTS(proxy_resolver, PROXY_RESOLVER, 1)
 DEFINE_TEST_EXISTS(screenshot, SCREENSHOT, 2)
 DEFINE_TEST_EXISTS(settings, SETTINGS, 1)
 DEFINE_TEST_EXISTS(trash, TRASH, 1)
 DEFINE_TEST_EXISTS(wallpaper, WALLPAPER, 1)
+DEFINE_TEST_EXISTS(realtime, REALTIME, 1)
 
 int
 main (int argc, char **argv)
 {
   int res;
+
+  g_log_writer_default_set_use_stderr (TRUE);
 
   setlocale (LC_ALL, NULL);
 
@@ -414,6 +468,7 @@ main (int argc, char **argv)
   g_test_add_func ("/portal/settings/exists", test_settings_exists);
   g_test_add_func ("/portal/trash/exists", test_trash_exists);
   g_test_add_func ("/portal/wallpaper/exists", test_wallpaper_exists);
+  g_test_add_func ("/portal/realtime/exists", test_realtime_exists);
 
 #ifdef HAVE_LIBPORTAL
   g_test_add_func ("/portal/account/basic", test_account_basic);
@@ -428,6 +483,7 @@ main (int argc, char **argv)
   g_test_add_func ("/portal/email/cancel", test_email_cancel);
   g_test_add_func ("/portal/email/close", test_email_close);
   g_test_add_func ("/portal/email/address", test_email_address);
+  g_test_add_func ("/portal/email/punycode_address", test_email_punycode_address);
   g_test_add_func ("/portal/email/subject", test_email_subject);
   g_test_add_func ("/portal/email/parallel", test_email_parallel);
 

@@ -44,22 +44,23 @@ typedef struct _EmailClass EmailClass;
 
 struct _Email
 {
-  XdpEmailSkeleton parent_instance;
+  XdpDbusEmailSkeleton parent_instance;
 };
 
 struct _EmailClass
 {
-  XdpEmailSkeletonClass parent_class;
+  XdpDbusEmailSkeletonClass parent_class;
 };
 
-static XdpImplEmail *impl;
+static XdpDbusImplEmail *impl;
 static Email *email;
 
 GType email_get_type (void) G_GNUC_CONST;
-static void email_iface_init (XdpEmailIface *iface);
+static void email_iface_init (XdpDbusEmailIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Email, email, XDP_TYPE_EMAIL_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_EMAIL, email_iface_init));
+G_DEFINE_TYPE_WITH_CODE (Email, email, XDP_DBUS_TYPE_EMAIL_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_EMAIL,
+                                                email_iface_init));
 
 static void
 send_response_in_thread_func (GTask        *task,
@@ -79,9 +80,9 @@ send_response_in_thread_func (GTask        *task,
 
   if (request->exported)
     {
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 response,
-                                 g_variant_builder_end (&new_results));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      response,
+                                      g_variant_builder_end (&new_results));
       request_unexport (request);
     }
 }
@@ -97,12 +98,13 @@ compose_email_done (GObject *source,
   g_autoptr(GError) error = NULL;
   g_autoptr(GTask) task = NULL;
 
-  if (!xdp_impl_email_call_compose_email_finish (XDP_IMPL_EMAIL (source),
-                                                 &response,
-                                                 &results,
-                                                 result,
-                                                 &error))
+  if (!xdp_dbus_impl_email_call_compose_email_finish (XDP_DBUS_IMPL_EMAIL (source),
+                                                      &response,
+                                                      &results,
+                                                      result,
+                                                      &error))
     {
+      g_dbus_error_strip_remote_error (error);
       g_warning ("Backend call failed: %s", error->message);
     }
 
@@ -116,7 +118,11 @@ compose_email_done (GObject *source,
 static gboolean
 is_valid_email (const char *string)
 {
-  return g_regex_match_simple ("^\\w+([-+.]\\w+)*@\\w+([-.]\\w+)*\\.\\w+([-.]\\w+)*$", string, 0, 0);
+  // Regex proposed by the W3C at https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
+  return g_regex_match_simple ("^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+"
+                               "@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+                               "(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
+                               string, 0, 0);
 }
 
 static gboolean
@@ -190,11 +196,12 @@ static XdpOptionKey compose_email_options[] = {
   { "cc", G_VARIANT_TYPE_STRING_ARRAY, validate_email_addresses },
   { "bcc", G_VARIANT_TYPE_STRING_ARRAY, validate_email_addresses },
   { "subject", G_VARIANT_TYPE_STRING, validate_email_subject },
-  { "body", G_VARIANT_TYPE_STRING, NULL }
+  { "body", G_VARIANT_TYPE_STRING, NULL },
+  { "activation_token", G_VARIANT_TYPE_STRING, NULL },
 };
 
 static gboolean
-handle_compose_email (XdpEmail *object,
+handle_compose_email (XdpDbusEmail *object,
                       GDBusMethodInvocation *invocation,
                       GUnixFDList *fd_list,
                       const gchar *arg_parent_window,
@@ -203,7 +210,7 @@ handle_compose_email (XdpEmail *object,
   Request *request = request_from_invocation (invocation);
   const char *app_id = xdp_app_info_get_id (request->app_info);
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   GVariantBuilder options;
   g_autoptr(GVariant) attachment_fds = NULL;
 
@@ -211,15 +218,15 @@ handle_compose_email (XdpEmail *object,
 
   REQUEST_AUTOLOCK (request);
 
-  impl_request = xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                                  G_DBUS_PROXY_FLAGS_NONE,
-                                                  g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                                  request->id,
-                                                  NULL, &error);
+  impl_request = xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                                       G_DBUS_PROXY_FLAGS_NONE,
+                                                       g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                                       request->id,
+                                                       NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_variant_builder_init (&options, G_VARIANT_TYPE_VARDICT);
@@ -242,7 +249,7 @@ handle_compose_email (XdpEmail *object,
           if (fd == -1)
             {
               g_dbus_method_invocation_return_gerror (invocation, error);
-              return TRUE;
+              return G_DBUS_METHOD_INVOCATION_HANDLED;
             }
 
           path = xdp_app_info_get_path_for_fd (request->app_info, fd, 0, NULL, NULL, &error);
@@ -270,28 +277,28 @@ handle_compose_email (XdpEmail *object,
     {
       g_debug ("Returning an error from option filtering");
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
   request_export (request, g_dbus_method_invocation_get_connection (invocation));
 
-  xdp_email_complete_compose_email (object, invocation, NULL, request->id);
+  xdp_dbus_email_complete_compose_email (object, invocation, NULL, request->id);
 
-  xdp_impl_email_call_compose_email (impl,
-                                     request->id,
-                                     app_id,
-                                     arg_parent_window,
-                                     g_variant_builder_end (&options),
-                                     NULL,
-                                     compose_email_done,
-                                     g_object_ref (request));
+  xdp_dbus_impl_email_call_compose_email (impl,
+                                          request->id,
+                                          app_id,
+                                          arg_parent_window,
+                                          g_variant_builder_end (&options),
+                                          NULL,
+                                          compose_email_done,
+                                          g_object_ref (request));
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-email_iface_init (XdpEmailIface *iface)
+email_iface_init (XdpDbusEmailIface *iface)
 {
   iface->handle_compose_email = handle_compose_email;
 }
@@ -299,7 +306,7 @@ email_iface_init (XdpEmailIface *iface)
 static void
 email_init (Email *email)
 {
-  xdp_email_set_version (XDP_EMAIL (email), 3);
+  xdp_dbus_email_set_version (XDP_DBUS_EMAIL (email), 4);
 }
 
 static void
@@ -313,12 +320,12 @@ email_create (GDBusConnection *connection,
 {
   g_autoptr(GError) error = NULL;
 
-  impl = xdp_impl_email_proxy_new_sync (connection,
-                                        G_DBUS_PROXY_FLAGS_NONE,
-                                        dbus_name,
-                                        DESKTOP_PORTAL_OBJECT_PATH,
-                                        NULL,
-                                        &error);
+  impl = xdp_dbus_impl_email_proxy_new_sync (connection,
+                                             G_DBUS_PROXY_FLAGS_NONE,
+                                             dbus_name,
+                                             DESKTOP_PORTAL_OBJECT_PATH,
+                                             NULL,
+                                             &error);
 
   if (impl == NULL)
     {

@@ -3,12 +3,12 @@
 #include "print.h"
 
 #include <libportal/portal.h>
-#include "src/xdp-utils.h"
-#include "src/xdp-impl-dbus.h"
+#include "xdp-utils.h"
+#include "xdp-impl-dbus.h"
 
 #include "utils.h"
 
-extern XdpImplLockdown *lockdown;
+extern XdpDbusImplLockdown *lockdown;
 
 extern char outdir[];
 
@@ -436,7 +436,6 @@ test_print_lockdown (void)
   g_autoptr(GKeyFile) keyfile = NULL;
   g_autoptr(GError) error = NULL;
   g_autofree char *path = NULL;
-  g_autoptr(GDBusConnection) session_bus = NULL;
 
   tests_set_property_sync (G_DBUS_PROXY (lockdown),
                            "org.freedesktop.impl.portal.Lockdown",

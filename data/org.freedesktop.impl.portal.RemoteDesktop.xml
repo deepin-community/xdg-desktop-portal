@@ -22,6 +22,8 @@
       @short_description: Remote desktop portal backend interface
 
       The Remote desktop portal allows to create remote desktop sessions.
+
+      This documentation describes version 2 of this interface.
   -->
   <interface name="org.freedesktop.impl.portal.RemoteDesktop">
     <!--
@@ -59,6 +61,71 @@
       <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
       <arg type="a{sv}" name="results" direction="out"/>
     </method>
+    <!--
+        SelectDevices:
+        @handle: Object path for the #org.freedesktop.impl.portal.Request object representing this call
+        @session_handle: Object path for the #org.freedesktop.impl.portal.Session object representing the session
+        @app_id: App id of the application
+        @options: Vardict with optional further information
+        @response: Numeric response
+        @results: Vardict with the results of the call
+
+        Configure what the devices remote desktop session should expose.
+
+        Supported keys in the @options vardict include:
+        <variablelist>
+          <varlistentry>
+            <term>types u</term>
+            <listitem><para>
+              Bitmask of what device types to request remote controlling of.
+              Default is all.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>restore_data (suv)</term>
+            <listitem><para>
+              The data to restore from a previous session.
+            </para>
+            <para>
+              If the stored session cannot be restored, this value is ignored
+              and the user will be prompted normally. This may happen when, for
+              example, the session contains a monitor or a window that is not
+              available anymore, or when the stored permissions are withdrawn.
+            </para>
+            <para>
+              The restore data is composed of the vendor name (e.g. "GNOME" or
+              "KDE"), the version of the implementation-specific private data,
+              and the implementation-specific private data itself.
+            </para>
+            <para>
+              This option was added in version 2 of this interface.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>persist_mode u</term>
+            <listitem><para>
+              How this session should persist. Default is 0. Accepted values are:
+            </para>
+            <para>
+              <simplelist>
+                <member>0: Do not persist (default)</member>
+                <member>1: Permissions persist as long as the application is running</member>
+                <member>2: Permissions persist until explicitly revoked</member>
+              </simplelist>
+            </para>
+            <para>
+              If the permission for the session to persist is granted, "restore_data"
+              will be returned via the #org.freedesktop.portal.Request::Response
+              signal of the #org.freedesktop.impl.portal.RemoteDesktop.Start method.
+            </para>
+            <para>
+              This option was added in version 2 of this interface.
+            </para></listitem>
+          </varlistentry>
+        </variablelist>
+
+        For available device types, see the AvailableDeviceTypes property.
+    -->
     <method name="SelectDevices">
       <arg type="o" name="handle" direction="in"/>
       <arg type="o" name="session_handle" direction="in"/>
@@ -79,7 +146,53 @@
         @response: Numeric response
         @results: Vardict with the results of the call
 
-        Start the remote desktop session.
+        Start the remote desktop session. This will typically result the portal
+        presenting a dialog.
+
+        Supported keys in the @options vardict include:
+        <variablelist>
+          <varlistentry>
+            <term>handle_token s</term>
+            <listitem><para>
+              A string that will be used as the last element of the @handle. Must be a valid
+              object path element. See the #org.freedesktop.portal.Request documentation for
+              more information about the @handle.
+            </para></listitem>
+          </varlistentry>
+        </variablelist>
+
+        The following results get returned via the
+        #org.freedesktop.portal.Request::Response signal:
+        <variablelist>
+          <varlistentry>
+            <term>devices u</term>
+            <listitem><para>
+              A bitmask of the devices selected by the user.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>clipboard_enabled b</term>
+            <listitem><para>
+              A boolean for whether the clipboard was enabled ('true') or not ('false'). 
+              See the #org.freedesktop.portal.Clipboard documentation for more information.
+              Since version 2.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>streams a(ua{sv})</term>
+            <listitem><para>
+              Equivalent to the streams entry documented in
+              #org.freedesktop.impl.portal.ScreenCast.Start.
+            </para></listitem>
+          </varlistentry>
+          <varlistentry>
+            <term>devices u</term>
+            <listitem><para>
+              The device types that can be used for remote control. See the
+              AvailableDeviceTypes property.
+            </para></listitem>
+          </varlistentry>
+        </variablelist>
     -->
     <method name="Start">
       <arg type="o" name="handle" direction="in"/>
@@ -316,6 +429,26 @@
       <arg type="o" name="session_handle" direction="in"/>
       <arg type="a{sv}" name="options" direction="in"/>
       <arg type="u" name="slot" direction="in"/>
+    </method>
+    <!--
+        ConnectToEIS:
+        @session_handle: Object path for the #org.freedesktop.portal.Session object
+        @app_id: App id of the application
+        @options: Vardict with optional further information
+        @fd: A file descriptor to an EIS implementation that can be passed to a
+        sender libei context
+
+        Request a connection to an EIS implementation.
+
+        This method is available in version 2 of this interface.
+    -->
+    <method name="ConnectToEIS">
+      <annotation name="org.gtk.GDBus.C.UnixFD" value="true"/>
+      <arg type="o" name="session_handle" direction="in"/>
+      <arg type="s" name="app_id" direction="in"/>
+      <annotation name="org.qtproject.QtDBus.QtTypeName.Out1" value="QVariantMap"/>
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="h" name="fd" direction="out"/>
     </method>
     <!--
         AvailableDeviceTypes:

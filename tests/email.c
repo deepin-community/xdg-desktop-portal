@@ -3,7 +3,7 @@
 #include "email.h"
 
 #include <libportal/portal.h>
-#include "src/xdp-utils.h"
+#include "xdp-utils.h"
 
 extern char outdir[];
 
@@ -120,6 +120,48 @@ test_email_address (void)
                             addresses, NULL, NULL,
                             NULL,
                             NULL,
+                            NULL,
+                            0,
+                            NULL,
+                            email_cb,
+                            keyfile);
+
+  while (!got_info)
+    g_main_context_iteration (NULL, TRUE);
+}
+
+/* test that punycode-encoded email addresses pass validation
+ */
+void
+test_email_punycode_address (void)
+{
+  g_autoptr(XdpPortal) portal = NULL;
+  g_autoptr(GKeyFile) keyfile = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *path = NULL;
+  const char *addresses[2] = { "xn--franais-xxa@exemple.fr", NULL };
+
+  keyfile = g_key_file_new ();
+
+  g_key_file_set_string (keyfile, "input", "address", "xn--franais-xxa@exemple.fr");
+  g_key_file_set_string (keyfile, "input", "subject", "Re: portal tests");
+  g_key_file_set_string (keyfile, "input", "body", "To ASCII and beyond");
+
+  g_key_file_set_integer (keyfile, "backend", "delay", 0);
+  g_key_file_set_integer (keyfile, "backend", "response", 0);
+  g_key_file_set_integer (keyfile, "result", "response", 0);
+
+  path = g_build_filename (outdir, "email", NULL);
+  g_key_file_save_to_file (keyfile, path, &error);
+  g_assert_no_error (error);
+
+  portal = xdp_portal_new ();
+
+  got_info = 0;
+  xdp_portal_compose_email (portal, NULL,
+                            addresses, NULL, NULL,
+                            "Re: portal tests",
+                            "To ASCII and beyond",
                             NULL,
                             0,
                             NULL,

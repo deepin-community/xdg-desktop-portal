@@ -3,36 +3,36 @@
 #include "inhibit.h"
 
 #include <libportal/portal.h>
-#include "src/xdp-impl-dbus.h"
+#include "xdp-impl-dbus.h"
 
 extern char outdir[];
 
-extern XdpImplPermissionStore *permission_store;
+extern XdpDbusImplPermissionStore *permission_store;
 
 static void
 set_inhibit_permissions (const char **permissions)
 {
   g_autoptr(GError) error = NULL;
 
-  xdp_impl_permission_store_call_set_permission_sync (permission_store,
-                                                      "inhibit",
-                                                      TRUE,
-                                                      "inhibit",
-                                                      "",
-                                                      permissions,
-                                                      NULL,
-                                                      &error);
+  xdp_dbus_impl_permission_store_call_set_permission_sync (permission_store,
+                                                           "inhibit",
+                                                           TRUE,
+                                                           "inhibit",
+                                                           "",
+                                                           permissions,
+                                                           NULL,
+                                                           &error);
   g_assert_no_error (error);
 }
 
 static void
 unset_inhibit_permissions (void)
 {
-  xdp_impl_permission_store_call_delete_sync (permission_store,
-                                              "inhibit",
-                                              "inhibit",
-                                              NULL,
-                                              NULL);
+  xdp_dbus_impl_permission_store_call_delete_sync (permission_store,
+                                                   "inhibit",
+                                                   "inhibit",
+                                                   NULL,
+                                                   NULL);
   /* Ignore the error here, since this fails if the table doesn't exist */
 }
 
@@ -58,13 +58,13 @@ inhibit_cb (GObject *object,
 
   if (response == 0)
     {
-      g_assert_cmpint (id, >, 0);
       g_assert_no_error (error);
+      g_assert_cmpint (id, >, 0);
     }
   else
     {
-      g_assert_cmpint (id, ==, -1);
       g_assert_nonnull (error);
+      g_assert_cmpint (id, ==, -1);
     }
 
   g_assert (0 <= got_info && got_info < 3);
@@ -387,7 +387,7 @@ test_inhibit_monitor (void)
   g_signal_handler_disconnect (portal, id);
 
   /* now wait for the query-end state */
-  g_print ("waiting for query-end state\n");
+  g_debug ("waiting for query-end state\n");
   got_info = 0;
   g_signal_connect (portal, "session-state-changed", G_CALLBACK (session_state_changed_cb2), NULL);
 

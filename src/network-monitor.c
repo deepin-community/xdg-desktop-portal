@@ -33,26 +33,28 @@ typedef struct _NetworkMonitorClass NetworkMonitorClass;
 
 struct _NetworkMonitor
 {
-  XdpNetworkMonitorSkeleton parent_instance;
+  XdpDbusNetworkMonitorSkeleton parent_instance;
 
   GNetworkMonitor *monitor;
 };
 
 struct _NetworkMonitorClass
 {
-  XdpNetworkMonitorSkeletonClass parent_class;
+  XdpDbusNetworkMonitorSkeletonClass parent_class;
 };
 
 static NetworkMonitor *network_monitor;
 
 GType network_monitor_get_type (void) G_GNUC_CONST;
-static void network_monitor_iface_init (XdpNetworkMonitorIface *iface);
+static void network_monitor_iface_init (XdpDbusNetworkMonitorIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (NetworkMonitor, network_monitor, XDP_TYPE_NETWORK_MONITOR_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_NETWORK_MONITOR, network_monitor_iface_init));
+G_DEFINE_TYPE_WITH_CODE (NetworkMonitor, network_monitor,
+                         XDP_DBUS_TYPE_NETWORK_MONITOR_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_NETWORK_MONITOR,
+                                                network_monitor_iface_init));
 
 static gboolean
-handle_get_available (XdpNetworkMonitor     *object,
+handle_get_available (XdpDbusNetworkMonitor *object,
                       GDBusMethodInvocation *invocation)
 {
   Request *request = request_from_invocation (invocation);
@@ -72,11 +74,11 @@ handle_get_available (XdpNetworkMonitor     *object,
       g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", available));
     }
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-handle_get_metered (XdpNetworkMonitor     *object,
+handle_get_metered (XdpDbusNetworkMonitor *object,
                     GDBusMethodInvocation *invocation)
 {
   Request *request = request_from_invocation (invocation);
@@ -96,11 +98,11 @@ handle_get_metered (XdpNetworkMonitor     *object,
       g_dbus_method_invocation_return_value (invocation, g_variant_new ("(b)", metered));
     }
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-handle_get_connectivity (XdpNetworkMonitor     *object,
+handle_get_connectivity (XdpDbusNetworkMonitor *object,
                          GDBusMethodInvocation *invocation)
 {
   Request *request = request_from_invocation (invocation);
@@ -120,11 +122,11 @@ handle_get_connectivity (XdpNetworkMonitor     *object,
       g_dbus_method_invocation_return_value (invocation, g_variant_new ("(u)", connectivity));
     }
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-handle_get_status (XdpNetworkMonitor     *object,
+handle_get_status (XdpDbusNetworkMonitor *object,
                    GDBusMethodInvocation *invocation)
 {
   Request *request = request_from_invocation (invocation);
@@ -156,7 +158,7 @@ handle_get_status (XdpNetworkMonitor     *object,
       g_dbus_method_invocation_return_value (invocation, g_variant_new ("(a{sv})", &status));
     }
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
@@ -174,7 +176,7 @@ can_reach_done (GObject      *source,
 }
 
 static gboolean
-handle_can_reach (XdpNetworkMonitor     *object,
+handle_can_reach (XdpDbusNetworkMonitor *object,
                   GDBusMethodInvocation *invocation,
                   const char            *hostname,
                   guint                  port)
@@ -197,11 +199,11 @@ handle_can_reach (XdpNetworkMonitor     *object,
       g_network_monitor_can_reach_async (nm->monitor, address, NULL, can_reach_done, g_object_ref (invocation)); 
     }
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-network_monitor_iface_init (XdpNetworkMonitorIface *iface)
+network_monitor_iface_init (XdpDbusNetworkMonitorIface *iface)
 {
   iface->handle_get_available = handle_get_available;
   iface->handle_get_metered = handle_get_metered;
@@ -215,7 +217,7 @@ network_changed (GObject *object,
                  gboolean network_available,
                  NetworkMonitor *nm)
 {
-  xdp_network_monitor_emit_changed (XDP_NETWORK_MONITOR (nm));
+  xdp_dbus_network_monitor_emit_changed (XDP_DBUS_NETWORK_MONITOR (nm));
 }
 
 static void
@@ -225,7 +227,7 @@ network_monitor_init (NetworkMonitor *nm)
 
   g_signal_connect (nm->monitor, "network-changed", G_CALLBACK (network_changed), nm);
 
-  xdp_network_monitor_set_version (XDP_NETWORK_MONITOR (nm), 3);
+  xdp_dbus_network_monitor_set_version (XDP_DBUS_NETWORK_MONITOR (nm), 3);
 }
 
 static void

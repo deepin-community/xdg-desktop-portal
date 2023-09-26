@@ -16,6 +16,8 @@
 #include "document-portal/document-portal-dbus.h"
 
 #include "can-use-fuse.h"
+#include "src/glib-backports.h"
+#include "utils.h"
 
 char outdir[] = "/tmp/xdp-test-XXXXXX";
 
@@ -474,7 +476,7 @@ test_recursive_doc (void)
   assert_doc_has_contents (id, basename, NULL, "recursive-content");
 
   path = make_doc_path (id, basename, NULL);
-  g_print ("path: %s\n", path);
+  g_debug ("path: %s\n", path);
 
   id2 = export_file (path, FALSE);
 
@@ -699,8 +701,10 @@ global_setup (void)
       return;
     }
 
+  g_log_writer_default_set_use_stderr (TRUE);
+
   g_mkdtemp (outdir);
-  g_print ("outdir: %s\n", outdir);
+  g_debug ("outdir: %s\n", outdir);
 
   fd = g_mkstemp (fuse_status_file);
   close (fd);
@@ -708,6 +712,9 @@ global_setup (void)
   g_setenv ("XDG_RUNTIME_DIR", outdir, TRUE);
   g_setenv ("XDG_DATA_HOME", outdir, TRUE);
   g_setenv ("TEST_DOCUMENT_PORTAL_FUSE_STATUS", fuse_status_file, TRUE);
+
+  /* Re-defining dbus-monitor with a custom script */
+  setup_dbus_daemon_wrapper (outdir);
 
   dbus = g_test_dbus_new (G_TEST_DBUS_NONE);
   services = g_test_build_filename (G_TEST_BUILT, "services", NULL);
@@ -784,7 +791,7 @@ static void
 global_teardown (void)
 {
   GError *error = NULL;
-  char *argv[] = { "fusermount", "-u", NULL, NULL };
+  char *argv[] = { "fusermount3", "-u", NULL, NULL };
   g_autofree char *by_app_dir = g_build_filename (mountpoint, "by-app", NULL);
   struct stat buf;
   g_autoptr(GFile) outdir_file = g_file_new_for_path (outdir);

@@ -35,10 +35,10 @@
         @handle: Object path for the created #org.freedesktop.portal.Session object
 
         Create a location session. A successfully created session can at
-        any time be closed using org.freedesktop.portal.Session::Close, or may
+        any time be closed using org.freedesktop.portal.Session.Close(), or may
         at any time be closed by the portal implementation, which will be
-        signalled via org.freedesktop.portal.Session::Closed.
-`
+        signalled via #org.freedesktop.portal.Session::Closed.
+
         Supported keys in the @options vardict include:
         <variablelist>
           <varlistentry>
@@ -115,45 +115,45 @@
         The following results may get returned via the @location:
         <variablelist>
           <varlistentry>
-            <term>latitude d</term>
+            <term>Latitude d</term>
             <listitem><para>
               The latitude, in degrees.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>longitude d</term>
+            <term>Longitude d</term>
             <listitem><para>
               The longitude, in degrees.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>altitude d</term>
+            <term>Altitude d</term>
             <listitem><para>
               The altitude, in meters.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>accuracy d</term>
+            <term>Accuracy d</term>
             <listitem><para>
               The accuracy, in meters.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>speed d</term>
+            <term>Speed d</term>
             <listitem><para>
               The speed, in meters per second.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>heading d</term>
+            <term>Heading d</term>
             <listitem><para>
               The heading, in degrees, going clockwise. North 0, East 90, South 180, West 270.
             </para></listitem>
           </varlistentry>
           <varlistentry>
-            <term>timestamp (tt)</term>
+            <term>Timestamp (tt)</term>
             <listitem><para>
-              The timestamp, as seconds and microsections since the Unix epoch.
+              The timestamp, as seconds and microseconds since the Unix epoch.
             </para></listitem>
           </varlistentry>
         </variablelist>

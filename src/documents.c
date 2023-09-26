@@ -32,30 +32,29 @@
 
 #include "xdp-dbus.h"
 #include "xdp-utils.h"
+#include "documents.h"
 #include "document-enums.h"
 
-static XdpDocuments *documents = NULL;
+static XdpDbusDocuments *documents = NULL;
 static char *documents_mountpoint = NULL;
 
 void
 init_document_proxy (GDBusConnection *connection)
 {
-  documents = xdp_documents_proxy_new_sync (connection, 0,
-                                            "org.freedesktop.portal.Documents",
-                                            "/org/freedesktop/portal/documents",
-                                            NULL, NULL);
-  xdp_documents_call_get_mount_point_sync (documents,
-                                           &documents_mountpoint,
-                                           NULL, NULL);
+  documents = xdp_dbus_documents_proxy_new_sync (connection, 0,
+                                                 "org.freedesktop.portal.Documents",
+                                                 "/org/freedesktop/portal/documents",
+                                                 NULL, NULL);
+  xdp_dbus_documents_call_get_mount_point_sync (documents,
+                                                &documents_mountpoint,
+                                                NULL, NULL);
   xdp_set_documents_mountpoint (documents_mountpoint);
 }
 
 char *
 register_document (const char *uri,
                    const char *app_id,
-                   gboolean for_save,
-                   gboolean writable,
-                   gboolean directory,
+                   DocumentFlags flags,
                    GError **error)
 {
   g_autofree char *doc_id = NULL;
@@ -74,15 +73,14 @@ register_document (const char *uri,
   gboolean handled_permissions = FALSE;
   DocumentAddFullFlags full_flags;
 
-  if (app_id == NULL || *app_id == 0)
-    return g_strdup (uri);
+  g_return_val_if_fail (app_id != NULL && *app_id != '\0', NULL);
 
   file = g_file_new_for_uri (uri);
   path = g_file_get_path (file);
   basename = g_path_get_basename (path);
   dirname = g_path_get_dirname (path);
 
-  if (for_save)
+  if (flags & DOCUMENT_FLAG_FOR_SAVE)
     fd = open (dirname, O_PATH | O_CLOEXEC);
   else
     fd = open (path, O_PATH | O_CLOEXEC);
@@ -102,73 +100,75 @@ register_document (const char *uri,
 
   i = 0;
   permissions[i++] = "read";
-  if (writable || for_save)
+  if ((flags & DOCUMENT_FLAG_WRITABLE) || (flags & DOCUMENT_FLAG_FOR_SAVE))
     permissions[i++] = "write";
   permissions[i++] = "grant-permissions";
+  if (flags & DOCUMENT_FLAG_DELETABLE)
+    permissions[i++] = "delete";
   permissions[i++] = NULL;
 
-  version = xdp_documents_get_version (documents);
+  version = xdp_dbus_documents_get_version (documents);
   full_flags = DOCUMENT_ADD_FLAGS_REUSE_EXISTING | DOCUMENT_ADD_FLAGS_PERSISTENT | DOCUMENT_ADD_FLAGS_AS_NEEDED_BY_APP;
-  if (directory)
+  if (flags & DOCUMENT_FLAG_DIRECTORY)
     full_flags |= DOCUMENT_ADD_FLAGS_DIRECTORY;
 
-  if (for_save)
+  if (flags & DOCUMENT_FLAG_FOR_SAVE)
     {
       if (version >= 3)
         {
-          ret = xdp_documents_call_add_named_full_sync (documents,
-                                                        g_variant_new_handle (fd_in),
-                                                        basename,
-                                                        full_flags,
-                                                        app_id,
-                                                        permissions,
-                                                        fd_list,
-                                                        &doc_id,
-                                                        NULL,
-                                                        NULL,
-                                                        NULL,
-                                                        error);
+          ret = xdp_dbus_documents_call_add_named_full_sync (documents,
+                                                             g_variant_new_handle (fd_in),
+                                                             basename,
+                                                             full_flags,
+                                                             app_id,
+                                                             permissions,
+                                                             fd_list,
+                                                             &doc_id,
+                                                             NULL,
+                                                             NULL,
+                                                             NULL,
+                                                             error);
           handled_permissions = TRUE;
         }
       else
-        ret = xdp_documents_call_add_named_sync (documents,
-                                                 g_variant_new_handle (fd_in),
-                                                 basename,
-                                                 TRUE,
-                                                 TRUE,
-                                                 fd_list,
-                                                 &doc_id,
-                                                 NULL,
-                                                 NULL,
-                                                 error);
+        ret = xdp_dbus_documents_call_add_named_sync (documents,
+                                                      g_variant_new_handle (fd_in),
+                                                      basename,
+                                                      TRUE,
+                                                      TRUE,
+                                                      fd_list,
+                                                      &doc_id,
+                                                      NULL,
+                                                      NULL,
+                                                      error);
     }
   else
     {
       if (version >= 2)
         {
-          ret = xdp_documents_call_add_full_sync (documents,
-                                                  g_variant_new_fixed_array (G_VARIANT_TYPE_HANDLE, &fd_in, 1, sizeof (gint32)),
-                                                  full_flags,
-                                                  app_id,
-                                                  permissions,
-                                                  fd_list,
-                                                  &doc_ids,
-                                                  NULL,
-                                                  NULL,
-                                                  NULL,
-                                                  error);
+          ret = xdp_dbus_documents_call_add_full_sync (documents,
+                                                       g_variant_new_fixed_array (G_VARIANT_TYPE_HANDLE, &fd_in, 1, sizeof (gint32)),
+                                                       full_flags,
+                                                       app_id,
+                                                       permissions,
+                                                       fd_list,
+                                                       &doc_ids,
+                                                       NULL,
+                                                       NULL,
+                                                       NULL,
+                                                       error);
           handled_permissions = TRUE;
         }
       else
-        ret = xdp_documents_call_add_sync (documents,
-                                           g_variant_new_handle (fd_in),
-                                           TRUE,
-                                           TRUE,
-                                           fd_list,
-                                           &doc_id,
-                                           NULL,
-                                           NULL,
-                                           error);
+        ret = xdp_dbus_documents_call_add_sync (documents,
+                                                g_variant_new_handle (fd_in),
+                                                TRUE,
+                                                TRUE,
+                                                fd_list,
+                                                &doc_id,
+                                                NULL,
+                                                NULL,
+                                                error);
     }
 
   g_object_unref (fd_list);
@@ -182,12 +182,12 @@ register_document (const char *uri,
 
   if (!handled_permissions)
     {
-      if (!xdp_documents_call_grant_permissions_sync (documents,
-                                                      doc_id,
-                                                      app_id,
-                                                      permissions,
-                                                      NULL,
-                                                      error))
+      if (!xdp_dbus_documents_call_grant_permissions_sync (documents,
+                                                           doc_id,
+                                                           app_id,
+                                                           permissions,
+                                                           NULL,
+                                                           error))
         return NULL;
     }
 
@@ -203,25 +203,44 @@ register_document (const char *uri,
 
 char *
 get_real_path_for_doc_path (const char *path,
-                            const char *app_id)
+                            XdpAppInfo *app_info)
 {
   g_autofree char *doc_id = NULL;
   gboolean ret = FALSE;
-  char *real_path = NULL;
+  g_autoptr(GError) error = NULL;
 
-  if (app_id == NULL || *app_id == '\0')
+  if (xdp_app_info_is_host (app_info))
     return g_strdup (path);
 
-  ret = xdp_documents_call_lookup_sync (documents, path, &doc_id, NULL, NULL);
+  ret = xdp_dbus_documents_call_lookup_sync (documents, path, &doc_id, NULL, &error);
   if (!ret)
-    return g_strdup (path);
+    {
+      g_debug ("document portal error for path '%s': %s", path, error->message);
+      return g_strdup (path);
+    }
 
   if (!g_strcmp0 (doc_id, ""))
-    return g_strdup (path);
+    {
+      g_debug ("document portal returned empty doc id for path '%s'", path);
+      return g_strdup (path);
+    }
 
-  ret = xdp_documents_call_info_sync (documents, doc_id, &real_path, NULL, NULL, NULL);
+  return get_real_path_for_doc_id (doc_id);
+}
+
+char *
+get_real_path_for_doc_id (const char *doc_id)
+{
+  gboolean ret = FALSE;
+  char *real_path = NULL;
+  g_autoptr (GError) error = NULL;
+
+  ret = xdp_dbus_documents_call_info_sync (documents, doc_id, &real_path, NULL, NULL, &error);
   if (!ret)
-    return g_strdup (path);
+    {
+      g_debug ("document portal error for doc id '%s': %s", doc_id, error->message);
+      return NULL;
+    }
 
   return real_path;
 }

@@ -34,7 +34,6 @@
   <interface name="org.freedesktop.portal.Screenshot">
     <!--
         Screenshot:
-        Supported keys in the @options vardict include:
         @parent_window: Identifier for the application window, see <link linkend="parent_window">Common Conventions</link>
         @options: Vardict with optional further information
         @handle: Object path for the #org.freedesktop.portal.Request object representing this call
@@ -60,7 +59,7 @@
           <varlistentry>
             <term>interactive b</term>
             <listitem><para>
-              Hint shether the dialog should offer customization before taking a screenshot.
+              Hint whether the dialog should offer customization before taking a screenshot.
               Default is no. Since version 2.
             </para></listitem>
           </varlistentry>
@@ -85,7 +84,7 @@
         @parent_window: Identifier for the application window, see <link linkend="parent_window">Common Conventions</link>
         @options: Vardict with optional further information
         @handle: Object path for the #org.freedesktop.portal.Request object representing this call
-         
+
         Obtains the color of a single pixel.
 
         Supported keys in the @options vardict include:
@@ -96,7 +95,7 @@
               A string that will be used as the last element of the @handle. Must be a valid
               object path element. See the #org.freedesktop.portal.Request documentation for
               more information about the @handle.
-            </para></listitem> 	
+            </para></listitem>
           </varlistentry>
         </variablelist>
 

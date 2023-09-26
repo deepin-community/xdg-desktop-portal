@@ -7,7 +7,7 @@ skip() {
 }
 
 skip_without_fuse () {
-    fusermount --version >/dev/null 2>&1 || skip "no fusermount"
+    fusermount3 --version >/dev/null 2>&1 || skip "no fusermount3"
 
     capsh --print | grep -q 'Bounding set.*[^a-z]cap_sys_admin' || \
         skip "No cap_sys_admin in bounding set, can't use FUSE"
@@ -47,13 +47,22 @@ export XDG_DATA_HOME=${TEST_DATA_DIR}/home/share
 export XDG_RUNTIME_DIR=${TEST_DATA_DIR}/runtime
 
 cleanup () {
-    fusermount -u "$XDG_RUNTIME_DIR/doc" || :
+    fusermount3 -u "$XDG_RUNTIME_DIR/doc" || :
     sleep 0.1
     kill "$DBUS_SESSION_BUS_PID"
     kill $(jobs -p) &> /dev/null || true
     rm -rf "$TEST_DATA_DIR"
 }
 trap cleanup EXIT
+
+ITERATIONS=3
+PARALLEL_TESTS=20
+PARALLEL_ITERATIONS=10
+
+if [ -n "$TEST_IN_CI" ]; then
+    PARALLEL_TESTS=10
+    PARALLEL_ITERATIONS=5
+fi
 
 sed "s#@testdir@#${test_builddir}#" "${test_srcdir}/session.conf.in" > session.conf
 
@@ -76,20 +85,18 @@ fi
 
 # First run a basic single-thread test
 echo Testing single-threaded
-"${test_srcdir}/test-document-fuse.py" --iterations 3 -v
+"${test_srcdir}/test-document-fuse.py" --iterations ${ITERATIONS} -v
 echo "ok single-threaded"
 
 # Then a bunch of copies in parallel to stress-test
 echo Testing in parallel
 PIDS=()
-for i in $(seq 20); do
-    "${test_srcdir}/test-document-fuse.py" --iterations 10 --prefix "$i" &
+for i in $(seq ${PARALLEL_TESTS}); do
+    "${test_srcdir}/test-document-fuse.py" --iterations ${PARALLEL_ITERATIONS} --prefix "$i" &
     PID="$!"
     PIDS+=( "$PID" )
 done
 
-for PID in "${PIDS[@]}"; do
-    echo waiting for pid "${PID}"
-    wait "${PID}"
-done
+echo waiting for pids "${PIDS[@]}"
+wait "${PIDS[@]}"
 echo "ok load-test"
