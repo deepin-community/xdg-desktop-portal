@@ -26,6 +26,8 @@
 #include "screen-cast.h"
 #include "remote-desktop.h"
 #include "request.h"
+#include "restore-token.h"
+#include "permissions.h"
 #include "pipewire.h"
 #include "xdp-dbus.h"
 #include "xdp-impl-dbus.h"
@@ -36,28 +38,29 @@
     .id = item_id, \
     .permissions = item_permissions \
   })
+#define SCREEN_CAST_TABLE "screencast"
 
 typedef struct _ScreenCast ScreenCast;
 typedef struct _ScreenCastClass ScreenCastClass;
 
 struct _ScreenCast
 {
-  XdpScreenCastSkeleton parent_instance;
+  XdpDbusScreenCastSkeleton parent_instance;
 };
 
 struct _ScreenCastClass
 {
-  XdpScreenCastSkeletonClass parent_class;
+  XdpDbusScreenCastSkeletonClass parent_class;
 };
 
-static XdpImplScreenCast *impl;
+static XdpDbusImplScreenCast *impl;
 static int impl_version;
 static ScreenCast *screen_cast;
 
 static unsigned int available_cursor_modes = 0;
 
 GType screen_cast_get_type (void);
-static void screen_cast_iface_init (XdpScreenCastIface *iface);
+static void screen_cast_iface_init (XdpDbusScreenCastIface *iface);
 
 static GQuark quark_request_session;
 
@@ -68,8 +71,9 @@ struct _ScreenCastStream
   int32_t height;
 };
 
-G_DEFINE_TYPE_WITH_CODE (ScreenCast, screen_cast, XDP_TYPE_SCREEN_CAST_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_SCREEN_CAST,
+G_DEFINE_TYPE_WITH_CODE (ScreenCast, screen_cast,
+                         XDP_DBUS_TYPE_SCREEN_CAST_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_SCREEN_CAST,
                                                 screen_cast_iface_init))
 
 typedef enum _ScreenCastSessionState
@@ -89,6 +93,9 @@ typedef struct _ScreenCastSession
   ScreenCastSessionState state;
 
   GList *streams;
+  char *restore_token;
+  PersistMode persist_mode;
+  GVariant *restore_data;
 } ScreenCastSession;
 
 typedef struct _ScreenCastSessionClass
@@ -99,6 +106,7 @@ typedef struct _ScreenCastSessionClass
 GType screen_cast_session_get_type (void);
 
 G_DEFINE_TYPE (ScreenCastSession, screen_cast_session, session_get_type ())
+
 
 static gboolean
 is_screen_cast_session (Session *session)
@@ -157,12 +165,13 @@ create_session_done (GObject *source_object,
 
   g_variant_builder_init (&results_builder, G_VARIANT_TYPE_VARDICT);
 
-  if (!xdp_impl_screen_cast_call_create_session_finish (impl,
-                                                        &response,
-                                                        NULL,
-                                                        res,
-                                                        &error))
+  if (!xdp_dbus_impl_screen_cast_call_create_session_finish (impl,
+                                                             &response,
+                                                             NULL,
+                                                             res,
+                                                             &error))
     {
+      g_dbus_error_strip_remote_error (error);
       g_warning ("A backend call failed: %s", error->message);
       should_close_session = TRUE;
       goto out;
@@ -192,9 +201,9 @@ create_session_done (GObject *source_object,
 out:
   if (request->exported)
     {
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 response,
-                                 g_variant_builder_end (&results_builder));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      response,
+                                      g_variant_builder_end (&results_builder));
       request_unexport (request);
     }
   else
@@ -207,13 +216,13 @@ out:
 }
 
 static gboolean
-handle_create_session (XdpScreenCast *object,
+handle_create_session (XdpDbusScreenCast *object,
                        GDBusMethodInvocation *invocation,
                        GVariant *arg_options)
 {
   Request *request = request_from_invocation (invocation);
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   Session *session;
   GVariantBuilder options_builder;
   GVariant *options;
@@ -221,15 +230,15 @@ handle_create_session (XdpScreenCast *object,
   REQUEST_AUTOLOCK (request);
 
   impl_request =
-    xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                     G_DBUS_PROXY_FLAGS_NONE,
-                                     g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                     request->id,
-                                     NULL, &error);
+    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                          G_DBUS_PROXY_FLAGS_NONE,
+                                          g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                          request->id,
+                                          NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
@@ -239,7 +248,7 @@ handle_create_session (XdpScreenCast *object,
   if (!session)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_variant_builder_init (&options_builder, G_VARIANT_TYPE_VARDICT);
@@ -250,18 +259,18 @@ handle_create_session (XdpScreenCast *object,
                            g_object_ref (session),
                            g_object_unref);
 
-  xdp_impl_screen_cast_call_create_session (impl,
-                                            request->id,
-                                            session->id,
-                                            xdp_app_info_get_id (request->app_info),
-                                            options,
-                                            NULL,
-                                            create_session_done,
-                                            g_object_ref (request));
+  xdp_dbus_impl_screen_cast_call_create_session (impl,
+                                                 request->id,
+                                                 session->id,
+                                                 xdp_app_info_get_id (request->app_info),
+                                                 options,
+                                                 NULL,
+                                                 create_session_done,
+                                                 g_object_ref (request));
 
-  xdp_screen_cast_complete_create_session (object, invocation, request->id);
+  xdp_dbus_screen_cast_complete_create_session (object, invocation, request->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
@@ -282,12 +291,15 @@ select_sources_done (GObject *source_object,
   SESSION_AUTOLOCK_UNREF (g_object_ref (session));
   g_object_set_qdata (G_OBJECT (request), quark_request_session, NULL);
 
-  if (!xdp_impl_screen_cast_call_select_sources_finish (impl,
-                                                        &response,
-                                                        &results,
-                                                        res,
-                                                        &error))
-    g_warning ("A backend call failed: %s", error->message);
+  if (!xdp_dbus_impl_screen_cast_call_select_sources_finish (impl,
+                                                             &response,
+                                                             &results,
+                                                             res,
+                                                             &error))
+    {
+      g_dbus_error_strip_remote_error (error);
+      g_warning ("A backend call failed: %s", error->message);
+    }
 
   should_close_session = !request->exported || response != 0;
 
@@ -301,7 +313,7 @@ select_sources_done (GObject *source_object,
           results = g_variant_ref_sink (g_variant_builder_end (&results_builder));
         }
 
-      xdp_request_emit_response (XDP_REQUEST (request), response, results);
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request), response, results);
       request_unexport (request);
     }
 
@@ -331,7 +343,7 @@ select_sources_done (GObject *source_object,
 }
 
 static gboolean
-validate_device_types (const char *key,
+validate_source_types (const char *key,
                        GVariant *value,
                        GVariant *options,
                        GError **error)
@@ -373,14 +385,96 @@ validate_cursor_mode (const char *key,
   return TRUE;
 }
 
+static gboolean
+validate_restore_token (const char *key,
+                        GVariant *value,
+                        GVariant *options,
+                        GError **error)
+{
+  const char *restore_token = g_variant_get_string (value, NULL);
+
+  if (!g_uuid_string_is_valid (restore_token))
+    {
+      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "Restore token is not a valid UUID string");
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+static gboolean
+validate_persist_mode (const char *key,
+                       GVariant *value,
+                       GVariant *options,
+                       GError **error)
+{
+  uint32_t mode = g_variant_get_uint32 (value);
+
+  if (mode > PERSIST_MODE_PERSISTENT)
+    {
+      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "Invalid persist mode %x", mode);
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
 static XdpOptionKey screen_cast_select_sources_options[] = {
-  { "types", G_VARIANT_TYPE_UINT32, validate_device_types },
+  { "types", G_VARIANT_TYPE_UINT32, validate_source_types },
   { "multiple", G_VARIANT_TYPE_BOOLEAN, NULL },
   { "cursor_mode", G_VARIANT_TYPE_UINT32, validate_cursor_mode },
+  { "restore_token", G_VARIANT_TYPE_STRING, validate_restore_token },
+  { "persist_mode", G_VARIANT_TYPE_UINT32, validate_persist_mode },
 };
 
 static gboolean
-handle_select_sources (XdpScreenCast *object,
+replace_screen_cast_restore_token_with_data (Session *session,
+                                             GVariant **in_out_options,
+                                             GError **error)
+{
+  g_autoptr(GVariant) options = NULL;
+  PersistMode persist_mode;
+
+  options = *in_out_options;
+
+  if (!g_variant_lookup (options, "persist_mode", "u", &persist_mode))
+    persist_mode = PERSIST_MODE_NONE;
+
+  if (is_remote_desktop_session (session))
+    {
+      if (persist_mode != PERSIST_MODE_NONE ||
+          xdp_variant_contains_key (options, "restore_token"))
+        {
+          g_set_error (error,
+                       XDG_DESKTOP_PORTAL_ERROR,
+                       XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                       "Remote desktop sessions cannot persist");
+          return FALSE;
+        }
+    }
+
+  if (is_screen_cast_session (session))
+    {
+      ScreenCastSession *screen_cast_session = (ScreenCastSession *)session;
+
+      screen_cast_session->persist_mode = persist_mode;
+      xdp_session_persistence_replace_restore_token_with_data (session,
+                                                               SCREEN_CAST_TABLE,
+                                                               in_out_options,
+                                                               &screen_cast_session->restore_token);
+    }
+  else
+    {
+      *in_out_options = g_steal_pointer (&options);
+    }
+
+  return TRUE;
+}
+
+static gboolean
+handle_select_sources (XdpDbusScreenCast *object,
                        GDBusMethodInvocation *invocation,
                        const char *arg_session_handle,
                        GVariant *arg_options)
@@ -388,8 +482,9 @@ handle_select_sources (XdpScreenCast *object,
   Request *request = request_from_invocation (invocation);
   Session *session;
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   GVariantBuilder options_builder;
+  GVariant *options;
 
   REQUEST_AUTOLOCK (request);
 
@@ -400,7 +495,7 @@ handle_select_sources (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   SESSION_AUTOLOCK_UNREF (session);
@@ -419,20 +514,20 @@ handle_select_sources (XdpScreenCast *object,
                                                  G_DBUS_ERROR,
                                                  G_DBUS_ERROR_FAILED,
                                                  "Sources already selected");
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         case SCREEN_CAST_SESSION_STATE_STARTING:
         case SCREEN_CAST_SESSION_STATE_STARTED:
           g_dbus_method_invocation_return_error (invocation,
                                                  G_DBUS_ERROR,
                                                  G_DBUS_ERROR_FAILED,
                                                  "Can only select sources before starting");
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         case SCREEN_CAST_SESSION_STATE_CLOSED:
           g_dbus_method_invocation_return_error (invocation,
                                                  G_DBUS_ERROR,
                                                  G_DBUS_ERROR_FAILED,
                                                  "Invalid session");
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         }
     }
   else if (is_remote_desktop_session (session))
@@ -446,7 +541,7 @@ handle_select_sources (XdpScreenCast *object,
                                                  G_DBUS_ERROR,
                                                  G_DBUS_ERROR_FAILED,
                                                  "Invalid state");
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         }
     }
   else
@@ -455,19 +550,19 @@ handle_select_sources (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   impl_request =
-    xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                     G_DBUS_PROXY_FLAGS_NONE,
-                                     g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                     request->id,
-                                     NULL, &error);
+    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                          G_DBUS_PROXY_FLAGS_NONE,
+                                          g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                          request->id,
+                                          NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
@@ -480,7 +575,19 @@ handle_select_sources (XdpScreenCast *object,
                            &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
+    }
+
+  options = g_variant_builder_end (&options_builder);
+
+  /* If 'restore_token' is passed, lookup the corresponding data in the
+   * permission store and / or the GHashTable with transient permissions.
+   * Portal implementations do not have access to the restore token.
+   */
+  if (!replace_screen_cast_restore_token_with_data (session, &options, &error))
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_object_set_qdata_full (G_OBJECT (request),
@@ -492,23 +599,19 @@ handle_select_sources (XdpScreenCast *object,
       ((ScreenCastSession *)session)->state =
         SCREEN_CAST_SESSION_STATE_SELECTING_SOURCES;
     }
-  else
-    {
-      remote_desktop_session_selecting_sources ((RemoteDesktopSession *)session);
-    }
 
-  xdp_impl_screen_cast_call_select_sources (impl,
-                                            request->id,
-                                            arg_session_handle,
-                                            xdp_app_info_get_id (request->app_info),
-                                            g_variant_builder_end (&options_builder),
-                                            NULL,
-                                            select_sources_done,
-                                            g_object_ref (request));
+  xdp_dbus_impl_screen_cast_call_select_sources (impl,
+                                                 request->id,
+                                                 arg_session_handle,
+                                                 xdp_app_info_get_id (request->app_info),
+                                                 options,
+                                                 NULL,
+                                                 select_sources_done,
+                                                 g_object_ref (request));
 
-  xdp_screen_cast_complete_select_sources (object, invocation, request->id);
+  xdp_dbus_screen_cast_complete_select_sources (object, invocation, request->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 uint32_t
@@ -624,12 +727,25 @@ collect_screen_cast_stream_data (GVariantIter *streams_iter)
   return streams;
 }
 
+static void
+replace_restore_screen_cast_data_with_token (ScreenCastSession *screen_cast_session,
+                                             GVariant **in_out_results)
+{
+  xdp_session_persistence_replace_restore_data_with_token ((Session *) screen_cast_session,
+                                                           SCREEN_CAST_TABLE,
+                                                           in_out_results,
+                                                           &screen_cast_session->persist_mode,
+                                                           &screen_cast_session->restore_token,
+                                                           &screen_cast_session->restore_data);
+}
+
 static gboolean
 process_results (ScreenCastSession *screen_cast_session,
-                 GVariant *results,
+                 GVariant **in_out_results,
                  GError **error)
 {
   g_autoptr(GVariantIter) streams_iter = NULL;
+  GVariant *results = *in_out_results;
 
   if (!g_variant_lookup (results, "streams", "a(ua{sv})", &streams_iter))
     {
@@ -638,6 +754,8 @@ process_results (ScreenCastSession *screen_cast_session,
     }
 
   screen_cast_session->streams = collect_screen_cast_stream_data (streams_iter);
+  replace_restore_screen_cast_data_with_token (screen_cast_session,
+                                               in_out_results);
   return TRUE;
 }
 
@@ -660,12 +778,15 @@ start_done (GObject *source_object,
   SESSION_AUTOLOCK_UNREF (g_object_ref (session));
   g_object_set_qdata (G_OBJECT (request), quark_request_session, NULL);
 
-  if (!xdp_impl_screen_cast_call_start_finish (impl,
-                                               &response,
-                                               &results,
-                                               res,
-                                               &error))
-    g_warning ("A backend call failed: %s", error->message);
+  if (!xdp_dbus_impl_screen_cast_call_start_finish (impl,
+                                                    &response,
+                                                    &results,
+                                                    res,
+                                                    &error))
+    {
+      g_dbus_error_strip_remote_error (error);
+      g_warning ("A backend call failed: %s", error->message);
+    }
 
   should_close_session = !request->exported || response != 0;
 
@@ -675,7 +796,7 @@ start_done (GObject *source_object,
     {
       if (response == 0)
         {
-          if (!process_results (screen_cast_session, results, &error))
+          if (!process_results (screen_cast_session, &results, &error))
             {
               g_warning ("Failed to process results: %s", error->message);
               g_clear_error (&error);
@@ -693,7 +814,7 @@ start_done (GObject *source_object,
           results = g_variant_builder_end (&results_builder);
         }
 
-      xdp_request_emit_response (XDP_REQUEST (request), response, results);
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request), response, results);
       request_unexport (request);
     }
 
@@ -711,7 +832,7 @@ start_done (GObject *source_object,
 }
 
 static gboolean
-handle_start (XdpScreenCast *object,
+handle_start (XdpDbusScreenCast *object,
               GDBusMethodInvocation *invocation,
               const char *arg_session_handle,
               const char *arg_parent_window,
@@ -721,7 +842,7 @@ handle_start (XdpScreenCast *object,
   Session *session;
   ScreenCastSession *screen_cast_session;
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   GVariantBuilder options_builder;
   GVariant *options;
 
@@ -734,7 +855,7 @@ handle_start (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   SESSION_AUTOLOCK_UNREF (session);
@@ -750,35 +871,35 @@ handle_start (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Sources not selected");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     case SCREEN_CAST_SESSION_STATE_STARTING:
     case SCREEN_CAST_SESSION_STATE_STARTED:
       g_dbus_method_invocation_return_error (invocation,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Can only start once");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     case SCREEN_CAST_SESSION_STATE_CLOSED:
       g_dbus_method_invocation_return_error (invocation,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_object_set_data_full (G_OBJECT (request),
                           "window", g_strdup (arg_parent_window), g_free);
 
   impl_request =
-    xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                     G_DBUS_PROXY_FLAGS_NONE,
-                                     g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                     request->id,
-                                     NULL, &error);
+    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                          G_DBUS_PROXY_FLAGS_NONE,
+                                          g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                          request->id,
+                                          NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
@@ -793,23 +914,23 @@ handle_start (XdpScreenCast *object,
                            g_object_unref);
   screen_cast_session->state = SCREEN_CAST_SESSION_STATE_STARTING;
 
-  xdp_impl_screen_cast_call_start (impl,
-                                   request->id,
-                                   arg_session_handle,
-                                   xdp_app_info_get_id (request->app_info),
-                                   arg_parent_window,
-                                   options,
-                                   NULL,
-                                   start_done,
-                                   g_object_ref (request));
+  xdp_dbus_impl_screen_cast_call_start (impl,
+                                        request->id,
+                                        arg_session_handle,
+                                        xdp_app_info_get_id (request->app_info),
+                                        arg_parent_window,
+                                        options,
+                                        NULL,
+                                        start_done,
+                                        g_object_ref (request));
 
-  xdp_screen_cast_complete_start (object, invocation, request->id);
+  xdp_dbus_screen_cast_complete_start (object, invocation, request->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-handle_open_pipewire_remote (XdpScreenCast *object,
+handle_open_pipewire_remote (XdpDbusScreenCast *object,
                              GDBusMethodInvocation *invocation,
                              GUnixFDList *in_fd_list,
                              const char *arg_session_handle,
@@ -831,7 +952,7 @@ handle_open_pipewire_remote (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   SESSION_AUTOLOCK_UNREF (session);
@@ -855,7 +976,7 @@ handle_open_pipewire_remote (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   if (!streams)
@@ -864,7 +985,7 @@ handle_open_pipewire_remote (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "No streams available");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   remote = open_pipewire_screen_cast_remote (session->app_id, streams, &error);
@@ -874,7 +995,7 @@ handle_open_pipewire_remote (XdpScreenCast *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "%s", error->message);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   out_fd_list = g_unix_fd_list_new ();
@@ -890,17 +1011,17 @@ handle_open_pipewire_remote (XdpScreenCast *object,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Failed to append fd: %s",
                                              error->message);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  xdp_screen_cast_complete_open_pipewire_remote (object, invocation,
-                                                 out_fd_list,
-                                                 g_variant_new_handle (fd_id));
-  return TRUE;
+  xdp_dbus_screen_cast_complete_open_pipewire_remote (object, invocation,
+                                                      out_fd_list,
+                                                      g_variant_new_handle (fd_id));
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-screen_cast_iface_init (XdpScreenCastIface *iface)
+screen_cast_iface_init (XdpDbusScreenCastIface *iface)
 {
   iface->handle_create_session = handle_create_session;
   iface->handle_select_sources = handle_select_sources;
@@ -913,9 +1034,9 @@ sync_supported_source_types (ScreenCast *screen_cast)
 {
   unsigned int available_source_types;
 
-  available_source_types = xdp_impl_screen_cast_get_available_source_types (impl);
-  xdp_screen_cast_set_available_source_types (XDP_SCREEN_CAST (screen_cast),
-                                              available_source_types);
+  available_source_types = xdp_dbus_impl_screen_cast_get_available_source_types (impl);
+  xdp_dbus_screen_cast_set_available_source_types (XDP_DBUS_SCREEN_CAST (screen_cast),
+                                                   available_source_types);
 }
 
 static void
@@ -930,9 +1051,9 @@ static void
 sync_supported_cursor_modes (ScreenCast *screen_cast)
 {
 
-  available_cursor_modes = xdp_impl_screen_cast_get_available_cursor_modes (impl);
-  xdp_screen_cast_set_available_cursor_modes (XDP_SCREEN_CAST (screen_cast),
-                                              available_cursor_modes);
+  available_cursor_modes = xdp_dbus_impl_screen_cast_get_available_cursor_modes (impl);
+  xdp_dbus_screen_cast_set_available_cursor_modes (XDP_DBUS_SCREEN_CAST (screen_cast),
+                                                   available_cursor_modes);
 }
 
 static void
@@ -946,7 +1067,7 @@ on_supported_cursor_modes_changed (GObject *gobject,
 static void
 screen_cast_init (ScreenCast *screen_cast)
 {
-  xdp_screen_cast_set_version (XDP_SCREEN_CAST (screen_cast), 3);
+  xdp_dbus_screen_cast_set_version (XDP_DBUS_SCREEN_CAST (screen_cast), 5);
 
   g_signal_connect (impl, "notify::supported-source-types",
                     G_CALLBACK (on_supported_source_types_changed),
@@ -974,19 +1095,19 @@ screen_cast_create (GDBusConnection *connection,
 {
   g_autoptr(GError) error = NULL;
 
-  impl = xdp_impl_screen_cast_proxy_new_sync (connection,
-                                              G_DBUS_PROXY_FLAGS_NONE,
-                                              dbus_name,
-                                              DESKTOP_PORTAL_OBJECT_PATH,
-                                              NULL,
-                                              &error);
+  impl = xdp_dbus_impl_screen_cast_proxy_new_sync (connection,
+                                                   G_DBUS_PROXY_FLAGS_NONE,
+                                                   dbus_name,
+                                                   DESKTOP_PORTAL_OBJECT_PATH,
+                                                   NULL,
+                                                   &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create screen cast proxy: %s", error->message);
       return NULL;
     }
 
-  impl_version = xdp_impl_screen_cast_get_version (impl);
+  impl_version = xdp_dbus_impl_screen_cast_get_version (impl);
 
   g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (impl), G_MAXINT);
 
@@ -1002,6 +1123,12 @@ screen_cast_session_close (Session *session)
 
   screen_cast_session->state = SCREEN_CAST_SESSION_STATE_CLOSED;
 
+  xdp_session_persistence_generate_and_save_restore_token (session,
+                                                           SCREEN_CAST_TABLE,
+                                                           screen_cast_session->persist_mode,
+                                                           &screen_cast_session->restore_token,
+                                                           &screen_cast_session->restore_data);
+
   g_debug ("screen cast session owned by '%s' closed", session->sender);
 }
 
@@ -1009,6 +1136,9 @@ static void
 screen_cast_session_finalize (GObject *object)
 {
   ScreenCastSession *screen_cast_session = (ScreenCastSession *)object;
+
+  g_clear_pointer (&screen_cast_session->restore_token, g_free);
+  g_clear_pointer (&screen_cast_session->restore_data, g_variant_unref);
 
   g_list_free_full (screen_cast_session->streams,
                     (GDestroyNotify)screen_cast_stream_free);

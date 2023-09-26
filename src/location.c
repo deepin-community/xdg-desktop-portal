@@ -322,13 +322,14 @@ gclue_accuracy_level_to_string (GClueAccuracyLevel level)
 }
 
 static gboolean
-get_location_permissions (const char *app_id,
+get_location_permissions (XdpAppInfo *app_info,
                           GClueAccuracyLevel *accuracy,
                           gint64 *last_used)
 {
+  const char *app_id = xdp_app_info_get_id (app_info);
   g_auto(GStrv) perms = NULL;
 
-  if (app_id == NULL || app_id[0] == '\0')
+  if (xdp_app_info_is_host (app_info))
     {
       /* unsandboxed */
       *accuracy = GCLUE_ACCURACY_LEVEL_EXACT;
@@ -362,7 +363,6 @@ set_location_permissions (const char *app_id,
                           GClueAccuracyLevel accuracy,
                           gint64 timestamp)
 {
-  g_autoptr(GError) error = NULL;
   g_autofree char *date = NULL;
   const char *permissions[3];
 
@@ -383,28 +383,28 @@ set_location_permissions (const char *app_id,
 
 typedef struct
 {
-  XdpLocationSkeleton parent_instance;
+  XdpDbusLocationSkeleton parent_instance;
 } Location;
 
 typedef struct 
 {
-  XdpLocationSkeletonClass parent_class;
+  XdpDbusLocationSkeletonClass parent_class;
 } LocationClass;
 
 static Location *location;
-static XdpImplAccess *access_impl;
-static XdpImplLockdown *lockdown;
+static XdpDbusImplAccess *access_impl;
+static XdpDbusImplLockdown *lockdown;
 
 GType location_get_type (void) G_GNUC_CONST;
-static void location_iface_init (XdpLocationIface *iface);
+static void location_iface_init (XdpDbusLocationIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Location, location, XDP_TYPE_LOCATION_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_LOCATION, location_iface_init))
+G_DEFINE_TYPE_WITH_CODE (Location, location, XDP_DBUS_TYPE_LOCATION_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_LOCATION, location_iface_init))
 
 /*** CreateSession ***/
 
 static gboolean
-handle_create_session (XdpLocation *object,
+handle_create_session (XdpDbusLocation *object,
                        GDBusMethodInvocation *invocation,
                        GVariant *arg_options)
 {
@@ -413,21 +413,21 @@ handle_create_session (XdpLocation *object,
   guint threshold;
   guint accuracy;
 
-  if (xdp_impl_lockdown_get_disable_location (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_location (lockdown))
     {
       g_debug ("Location services disabled");
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Location services disabled");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   session = location_session_new (arg_options, invocation, &error);
   if (!session)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   if (g_variant_lookup (arg_options, "distance-threshold", "u", &threshold))
@@ -454,7 +454,7 @@ handle_create_session (XdpLocation *object,
                                                  XDG_DESKTOP_PORTAL_ERROR,
                                                  XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                                  "Invalid accuracy level");
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         }
     }
 
@@ -469,9 +469,9 @@ handle_create_session (XdpLocation *object,
       session_register ((Session *)session);
     }
 
-  xdp_location_complete_create_session (object, invocation, ((Session *)session)->id);
+  xdp_dbus_location_complete_create_session (object, invocation, ((Session *)session)->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 /*** Start ***/
@@ -503,21 +503,21 @@ handle_start_in_thread_func (GTask *task,
 
   app_id = xdp_app_info_get_id (request->app_info);
 
-  if (!get_location_permissions (app_id, &accuracy, &last_used))
+  if (!get_location_permissions (request->app_info, &accuracy, &last_used))
     {
       guint access_response = 2;
       g_autoptr(GVariant) access_results = NULL;
-      g_autoptr(XdpImplRequest) impl_request = NULL;
+      g_autoptr(XdpDbusImplRequest) impl_request = NULL;
       GVariantBuilder access_opt_builder;
       g_autofree char *title = NULL;
       g_autofree char *subtitle = NULL;
       const char *body;
 
-      impl_request = xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (access_impl)),
-                                                      G_DBUS_PROXY_FLAGS_NONE,
-                                                      g_dbus_proxy_get_name (G_DBUS_PROXY (access_impl)),
-                                                      request->id,
-                                                      NULL, NULL);
+      impl_request = xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (access_impl)),
+                                                           G_DBUS_PROXY_FLAGS_NONE,
+                                                           g_dbus_proxy_get_name (G_DBUS_PROXY (access_impl)),
+                                                           request->id,
+                                                           NULL, NULL);
 
       request_set_impl_request (request, impl_request);
 
@@ -529,42 +529,51 @@ handle_start_in_thread_func (GTask *task,
       g_variant_builder_add (&access_opt_builder, "{sv}",
                              "icon", g_variant_new_string ("find-location-symbolic"));
 
-      if (g_str_equal (app_id, ""))
+      if (g_strcmp0 (app_id, "") != 0)
         {
-          title = g_strdup (_("Grant Access to Your Location?"));
-          subtitle = g_strdup (_("An application wants to use your location."));
-        }
-      else
-        {
-          g_autofree char *id = NULL;
           g_autoptr(GDesktopAppInfo) info = NULL;
-          const char *name;
+          g_autofree gchar *id = NULL;
+          const gchar *name = NULL;
 
           id = g_strconcat (app_id, ".desktop", NULL);
           info = g_desktop_app_info_new (id);
-          name = g_app_info_get_display_name (G_APP_INFO (info));
+
+          if (info)
+            name = g_app_info_get_display_name (G_APP_INFO (info));
+          else
+            name = app_id;
 
           title = g_strdup_printf (_("Give %s Access to Your Location?"), name);
-          if (g_desktop_app_info_has_key (info, "X-Geoclue-Reason"))
+
+          if (info && g_desktop_app_info_has_key (info, "X-Geoclue-Reason"))
             subtitle = g_desktop_app_info_get_string (info, "X-Geoclue-Reason");
           else
             subtitle = g_strdup_printf (_("%s wants to use your location."), name);
         }
+      else
+        {
+          /* Note: this will set the location permission for all unsandboxed
+           * apps for which an app ID can't be determined.
+           */
+          g_assert (xdp_app_info_is_host (request->app_info));
+          title = g_strdup (_("Grant Access to Your Location?"));
+          subtitle = g_strdup (_("An application wants to use your location."));
+        }
 
       body = _("Location access can be changed at any time from the privacy settings.");
 
-      if (!xdp_impl_access_call_access_dialog_sync (access_impl,
-                                                    request->id,
-                                                    app_id,
-                                                    parent_window,
-                                                    title,
-                                                    subtitle,
-                                                    body,
-                                                    g_variant_builder_end (&access_opt_builder),
-                                                    &access_response,
-                                                    &access_results,
-                                                    NULL,
-                                                    &error))
+      if (!xdp_dbus_impl_access_call_access_dialog_sync (access_impl,
+                                                         request->id,
+                                                         app_id,
+                                                         parent_window,
+                                                         title,
+                                                         subtitle,
+                                                         body,
+                                                         g_variant_builder_end (&access_opt_builder),
+                                                         &access_response,
+                                                         &access_results,
+                                                         NULL,
+                                                         &error))
         {
           g_warning ("Failed to show access dialog: %s", error->message);
           goto out;
@@ -606,9 +615,9 @@ out:
 
       g_debug ("sending response: %d", response);
       g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 response,
-                                 g_variant_builder_end (&opt_builder));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      response,
+                                      g_variant_builder_end (&opt_builder));
       request_unexport (request);
     }  
 
@@ -620,7 +629,7 @@ out:
 }
 
 static gboolean
-handle_start (XdpLocation *object,
+handle_start (XdpDbusLocation *object,
               GDBusMethodInvocation *invocation,
               const char *arg_session_handle,
               const char *arg_parent_window,
@@ -631,14 +640,14 @@ handle_start (XdpLocation *object,
   LocationSession *loc_session;
   g_autoptr(GTask) task = NULL;
 
-  if (xdp_impl_lockdown_get_disable_location (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_location (lockdown))
     {
       g_debug ("Location services disabled");
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Location services disabled");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   REQUEST_AUTOLOCK (request);
@@ -650,7 +659,7 @@ handle_start (XdpLocation *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   SESSION_AUTOLOCK_UNREF (session);
@@ -666,13 +675,13 @@ handle_start (XdpLocation *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Can only start once");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     case LOCATION_SESSION_STATE_CLOSED:
       g_dbus_method_invocation_return_error (invocation,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_FAILED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_export (request, g_dbus_method_invocation_get_connection (invocation));
@@ -686,19 +695,19 @@ handle_start (XdpLocation *object,
 
   loc_session->state = LOCATION_SESSION_STATE_STARTING;
 
-  xdp_location_complete_start (object, invocation, request->id);
+  xdp_dbus_location_complete_start (object, invocation, request->id);
 
   task = g_task_new (object, NULL, NULL, NULL);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_start_in_thread_func);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 /************/
 
 static void
-location_iface_init (XdpLocationIface *iface)
+location_iface_init (XdpDbusLocationIface *iface)
 {
   iface->handle_create_session = handle_create_session;
   iface->handle_start = handle_start;
@@ -707,7 +716,7 @@ location_iface_init (XdpLocationIface *iface)
 static void
 location_init (Location *location)
 {
-  xdp_location_set_version (XDP_LOCATION (location), 1);
+  xdp_dbus_location_set_version (XDP_DBUS_LOCATION (location), 1);
 }
 
 static void
@@ -725,11 +734,11 @@ location_create (GDBusConnection *connection,
 
   lockdown = lockdown_proxy;
 
-  access_impl = xdp_impl_access_proxy_new_sync (connection,
-                                                G_DBUS_PROXY_FLAGS_NONE,
-                                                dbus_name,
-                                                DESKTOP_PORTAL_OBJECT_PATH,
-                                                NULL, &error);
+  access_impl = xdp_dbus_impl_access_proxy_new_sync (connection,
+                                                     G_DBUS_PROXY_FLAGS_NONE,
+                                                     dbus_name,
+                                                     DESKTOP_PORTAL_OBJECT_PATH,
+                                                     NULL, &error);
   if (access_impl == NULL)
     {
       g_warning ("Failed to create access proxy: %s", error->message);

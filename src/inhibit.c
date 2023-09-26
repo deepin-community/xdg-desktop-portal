@@ -35,35 +35,36 @@
 #define PERMISSION_ID "inhibit"
 
 enum {
-  INHIBIT_LOGOUT  = 1,
-  INHIBIT_SWITCH  = 2,
-  INHIBIT_SUSPEND = 4,
-  INHIBIT_IDLE    = 8
+  INHIBIT_LOGOUT       = 1,
+  INHIBIT_USER_SWITCH  = 2,
+  INHIBIT_SUSPEND      = 4,
+  INHIBIT_IDLE         = 8
 };
 
-#define INHIBIT_ALL (INHIBIT_LOGOUT|INHIBIT_SWITCH|INHIBIT_SUSPEND|INHIBIT_IDLE)
+#define INHIBIT_ALL (INHIBIT_LOGOUT|INHIBIT_USER_SWITCH|INHIBIT_SUSPEND|INHIBIT_IDLE)
 
 typedef struct _Inhibit Inhibit;
 typedef struct _InhibitClass InhibitClass;
 
 struct _Inhibit
 {
-  XdpInhibitSkeleton parent_instance;
+  XdpDbusInhibitSkeleton parent_instance;
 };
 
 struct _InhibitClass
 {
-  XdpInhibitSkeletonClass parent_class;
+  XdpDbusInhibitSkeletonClass parent_class;
 };
 
-static XdpImplInhibit *impl;
+static XdpDbusImplInhibit *impl;
 static Inhibit *inhibit;
 
 GType inhibit_get_type (void) G_GNUC_CONST;
-static void inhibit_iface_init (XdpInhibitIface *iface);
+static void inhibit_iface_init (XdpDbusInhibitIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Inhibit, inhibit, XDP_TYPE_INHIBIT_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_INHIBIT, inhibit_iface_init));
+G_DEFINE_TYPE_WITH_CODE (Inhibit, inhibit, XDP_DBUS_TYPE_INHIBIT_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_INHIBIT,
+                                                inhibit_iface_init));
 
 static void
 inhibit_done (GObject *source,
@@ -76,8 +77,12 @@ inhibit_done (GObject *source,
 
   REQUEST_AUTOLOCK (request);
 
-  if (!xdp_impl_inhibit_call_inhibit_finish (impl, result, &error))
-    response = 2;
+  if (!xdp_dbus_impl_inhibit_call_inhibit_finish (impl, result, &error))
+    {
+      g_dbus_error_strip_remote_error (error);
+      g_warning ("A backend call failed: %s", error->message);
+      response = 2;
+    }
 
   if (request->exported)
     {
@@ -85,9 +90,9 @@ inhibit_done (GObject *source,
 
       g_variant_builder_init (&new_results, G_VARIANT_TYPE_VARDICT);
 
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 response,
-                                 g_variant_builder_end (&new_results));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      response,
+                                      g_variant_builder_end (&new_results));
     }
 }
 
@@ -108,7 +113,7 @@ get_allowed_inhibit (const char *app_id)
           if (strcmp (perms[i], "logout") == 0)
             ret |= INHIBIT_LOGOUT;
           else if (strcmp (perms[i], "switch") == 0)
-            ret |= INHIBIT_SWITCH;
+            ret |= INHIBIT_USER_SWITCH;
           else if (strcmp (perms[i], "suspend") == 0)
             ret |= INHIBIT_SUSPEND;
           else if (strcmp (perms[i], "idle") == 0)
@@ -150,15 +155,15 @@ handle_inhibit_in_thread_func (GTask *task,
     return;
 
   g_debug ("Calling inhibit backend for %s: %d", app_id, flags);
-  xdp_impl_inhibit_call_inhibit (impl,
-                                 request->id,
-                                 app_id,
-                                 window,
-                                 flags,
-                                 options,
-                                 NULL,
-                                 inhibit_done,
-                                 g_object_ref (request));
+  xdp_dbus_impl_inhibit_call_inhibit (impl,
+                                      request->id,
+                                      app_id,
+                                      window,
+                                      flags,
+                                      options,
+                                      NULL,
+                                      inhibit_done,
+                                      g_object_ref (request));
 }
 
 static gboolean
@@ -184,7 +189,7 @@ static XdpOptionKey inhibit_options[] = {
 };
 
 static gboolean
-handle_inhibit (XdpInhibit *object,
+handle_inhibit (XdpDbusInhibit *object,
                 GDBusMethodInvocation *invocation,
                 const char *arg_window,
                 guint32 arg_flags,
@@ -192,7 +197,7 @@ handle_inhibit (XdpInhibit *object,
 {
   Request *request = request_from_invocation (invocation);
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   g_autoptr(GTask) task = NULL;
   GVariantBuilder opt_builder;
   g_autoptr(GVariant) options = NULL;
@@ -205,7 +210,7 @@ handle_inhibit (XdpInhibit *object,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                              "Invalid flags");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
@@ -219,15 +224,15 @@ handle_inhibit (XdpInhibit *object,
   g_object_set_data (G_OBJECT (request), "flags", GUINT_TO_POINTER (arg_flags));
   g_object_set_data_full (G_OBJECT (request), "options", g_variant_ref (options), (GDestroyNotify)g_variant_unref);
 
-  impl_request = xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                                  G_DBUS_PROXY_FLAGS_NONE,
-                                                  g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                                  request->id,
-                                                  NULL, &error);
+  impl_request = xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                                       G_DBUS_PROXY_FLAGS_NONE,
+                                                       g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                                       request->id,
+                                                       NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
@@ -237,9 +242,9 @@ handle_inhibit (XdpInhibit *object,
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_inhibit_in_thread_func);
 
-  xdp_inhibit_complete_inhibit (object, invocation, request->id);
+  xdp_dbus_inhibit_complete_inhibit (object, invocation, request->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 typedef struct _InhibitSession
@@ -340,8 +345,9 @@ create_monitor_done (GObject *source_object,
 
   g_variant_builder_init (&results_builder, G_VARIANT_TYPE_VARDICT);
 
-  if (!xdp_impl_inhibit_call_create_monitor_finish (impl, &response, res, &error))
+  if (!xdp_dbus_impl_inhibit_call_create_monitor_finish (impl, &response, res, &error))
     {
+      g_dbus_error_strip_remote_error (error);
       g_warning ("A backend call failed: %s", error->message);
       should_close_session = TRUE;
       goto out;
@@ -371,9 +377,9 @@ create_monitor_done (GObject *source_object,
 out:
   if (request->exported)
     {
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 response,
-                                 g_variant_builder_end (&results_builder));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      response,
+                                      g_variant_builder_end (&results_builder));
       request_unexport (request);
     }
   else
@@ -386,28 +392,28 @@ out:
 }
 
 static gboolean
-handle_create_monitor (XdpInhibit *object,
+handle_create_monitor (XdpDbusInhibit *object,
                        GDBusMethodInvocation *invocation,
                        const char *arg_window,
                        GVariant *arg_options)
 {
   Request *request = request_from_invocation (invocation);
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   Session *session;
 
   REQUEST_AUTOLOCK (request);
 
   impl_request =
-    xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                     G_DBUS_PROXY_FLAGS_NONE,
-                                     g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                     request->id,
-                                     NULL, &error);
+    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                          G_DBUS_PROXY_FLAGS_NONE,
+                                          g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                          request->id,
+                                          NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
@@ -417,27 +423,27 @@ handle_create_monitor (XdpInhibit *object,
   if (!session)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_object_set_data_full (G_OBJECT (request), "session", g_object_ref (session), g_object_unref);
 
-  xdp_impl_inhibit_call_create_monitor (impl,
-                                        request->id,
-                                        session->id,
-                                        xdp_app_info_get_id (request->app_info),
-                                        arg_window,
-                                        NULL,
-                                        create_monitor_done,
-                                        g_object_ref (request));
+  xdp_dbus_impl_inhibit_call_create_monitor (impl,
+                                             request->id,
+                                             session->id,
+                                             xdp_app_info_get_id (request->app_info),
+                                             arg_window,
+                                             NULL,
+                                             create_monitor_done,
+                                             g_object_ref (request));
 
-  xdp_inhibit_complete_create_monitor (object, invocation, request->id);
+  xdp_dbus_inhibit_complete_create_monitor (object, invocation, request->id);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-handle_query_end_response (XdpInhibit            *object,
+handle_query_end_response (XdpDbusInhibit        *object,
                            GDBusMethodInvocation *invocation,
                            const char            *session_id)
 {
@@ -449,18 +455,19 @@ handle_query_end_response (XdpInhibit            *object,
                                              G_DBUS_ERROR,
                                              G_DBUS_ERROR_ACCESS_DENIED,
                                              "Invalid session");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  xdp_impl_inhibit_call_query_end_response (impl, session->id, NULL, NULL, NULL);
-  xdp_inhibit_complete_query_end_response (object, invocation);
+  xdp_dbus_impl_inhibit_call_query_end_response (impl, session->id,
+                                                 NULL, NULL, NULL);
+  xdp_dbus_inhibit_complete_query_end_response (object, invocation);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 
 static void
-inhibit_iface_init (XdpInhibitIface *iface)
+inhibit_iface_init (XdpDbusInhibitIface *iface)
 {
   iface->handle_inhibit = handle_inhibit;
   iface->handle_create_monitor = handle_create_monitor;
@@ -470,7 +477,7 @@ inhibit_iface_init (XdpInhibitIface *iface)
 static void
 inhibit_init (Inhibit *inhibit)
 {
-  xdp_inhibit_set_version (XDP_INHIBIT (inhibit), 3);
+  xdp_dbus_inhibit_set_version (XDP_DBUS_INHIBIT (inhibit), 3);
 }
 
 static void
@@ -479,7 +486,7 @@ inhibit_class_init (InhibitClass *klass)
 }
 
 static void
-state_changed_cb (XdpImplInhibit *impl,
+state_changed_cb (XdpDbusImplInhibit *impl,
                   const char *session_id,
                   GVariant *state,
                   gpointer data)
@@ -511,11 +518,11 @@ inhibit_create (GDBusConnection *connection,
 {
   g_autoptr(GError) error = NULL;
 
-  impl = xdp_impl_inhibit_proxy_new_sync (connection,
-                                          G_DBUS_PROXY_FLAGS_NONE,
-                                          dbus_name,
-                                          "/org/freedesktop/portal/desktop",
-                                          NULL, &error);
+  impl = xdp_dbus_impl_inhibit_proxy_new_sync (connection,
+                                               G_DBUS_PROXY_FLAGS_NONE,
+                                               dbus_name,
+                                               "/org/freedesktop/portal/desktop",
+                                               NULL, &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create inhibit proxy: %s", error->message);

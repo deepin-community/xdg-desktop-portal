@@ -29,8 +29,20 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdio.h>
+#ifdef HAVE_SYS_VFS_H
 #include <sys/vfs.h>
+#endif
+#ifdef HAVE_SYS_MOUNT_H
+#include <sys/mount.h>
+#endif
 
+#ifdef HAVE_LIBSYSTEMD
+#include <systemd/sd-login.h>
+#include "sd-escape.h"
+#endif
+
+#include <gio/gio.h>
+#include <gio/gunixoutputstream.h>
 #include <gio/gdesktopappinfo.h>
 
 #include "xdp-utils.h"
@@ -55,8 +67,8 @@ xdp_mkstempat (int    dir_fd,
   static const char letters[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   static const int NLETTERS = sizeof (letters) - 1;
-  glong value;
-  GTimeVal tv;
+  gint64 value;
+  gint64 current_time;
   static int counter = 0;
 
   g_return_val_if_fail (tmpl != NULL, -1);
@@ -71,12 +83,12 @@ xdp_mkstempat (int    dir_fd,
     }
 
   /* Get some more or less random data.  */
-  g_get_current_time (&tv);
-  value = (tv.tv_usec ^ tv.tv_sec) + counter++;
+  current_time = g_get_real_time ();
+  value = ((current_time % G_USEC_PER_SEC) ^ (current_time / G_USEC_PER_SEC)) + counter++;
 
   for (count = 0; count < 100; value += 7777, ++count)
     {
-      glong v = value;
+      gint64 v = value;
 
       /* Fill in the random bits.  */
       XXXXXX[0] = letters[v % NLETTERS];
@@ -107,13 +119,6 @@ xdp_mkstempat (int    dir_fd,
   return -1;
 }
 
-typedef enum
-{
-  XDP_APP_INFO_KIND_HOST = 0,
-  XDP_APP_INFO_KIND_FLATPAK = 1,
-  XDP_APP_INFO_KIND_SNAP    = 2,
-} XdpAppInfoKind;
-
 struct _XdpAppInfo {
   volatile gint ref_count;
   char *id;
@@ -125,7 +130,7 @@ struct _XdpAppInfo {
         {
           GKeyFile *keyfile;
 	   /* pid namespace mapping */
-          GMutex *pidns_lock;
+          GMutex pidns_lock;
           ino_t   pidns_id;
         } flatpak;
       struct
@@ -144,11 +149,92 @@ xdp_app_info_new (XdpAppInfoKind kind)
   return app_info;
 }
 
+#ifdef HAVE_LIBSYSTEMD
+char *
+_xdp_parse_app_id_from_unit_name (const char *unit)
+{
+  g_autoptr(GRegex) regex1 = NULL;
+  g_autoptr(GRegex) regex2 = NULL;
+  g_autoptr(GMatchInfo) match = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *app_id = NULL;
+
+  g_assert (g_str_has_prefix (unit, "app-"));
+
+  /*
+   * From https://systemd.io/DESKTOP_ENVIRONMENTS/ the format is one of:
+   * app[-<launcher>]-<ApplicationID>-<RANDOM>.scope
+   * app[-<launcher>]-<ApplicationID>-<RANDOM>.slice
+   */
+  regex1 = g_regex_new ("^app-(?:[[:alnum:]]+\\-)?(.+?)(?:\\-[[:alnum:]]*)(?:\\.scope|\\.slice)$", 0, 0, &error);
+  g_assert (error == NULL);
+  /*
+   * app[-<launcher>]-<ApplicationID>-autostart.service -> no longer true since systemd v248
+   * app[-<launcher>]-<ApplicationID>[@<RANDOM>].service
+   */
+  regex2 = g_regex_new ("^app-(?:[[:alnum:]]+\\-)?(.+?)(?:@[[:alnum:]]*|\\-autostart)?\\.service$", 0, 0, &error);
+  g_assert (error == NULL);
+
+  if (!g_regex_match (regex1, unit, 0, &match))
+    g_clear_pointer (&match, g_match_info_unref);
+
+  if (match == NULL && !g_regex_match (regex2, unit, 0, &match))
+    g_clear_pointer (&match, g_match_info_unref);
+
+  if (match != NULL)
+    {
+      const char *escaped_app_id;
+      /* Unescape the unit name which may have \x hex codes in it, e.g.
+       * "app-gnome-org.gnome.Evolution\x2dalarm\x2dnotify-2437.scope"
+       */
+      escaped_app_id = g_match_info_fetch (match, 1);
+      if (cunescape (escaped_app_id, UNESCAPE_RELAX, &app_id) < 0)
+        app_id = g_strdup ("");
+    }
+  else
+    {
+      app_id = g_strdup ("");
+    }
+
+  return g_steal_pointer (&app_id);
+}
+#endif /* HAVE_LIBSYSTEMD */
+
+void
+set_appid_from_pid (XdpAppInfo *app_info, pid_t pid)
+{
+#ifdef HAVE_LIBSYSTEMD
+  g_autofree char *unit = NULL;
+  int res;
+
+  g_return_if_fail (app_info->id == NULL);
+
+  res = sd_pid_get_user_unit (pid, &unit);
+  /*
+   * The session might not be managed by systemd or there could be an error
+   * fetching our own systemd units or the unit might not be started by the
+   * desktop environment (e.g. it's a script run from terminal).
+   */
+  if (res == -ENODATA || res < 0 || !unit || !g_str_has_prefix (unit, "app-"))
+    {
+      app_info->id = g_strdup ("");
+      return;
+    }
+
+  app_info->id = _xdp_parse_app_id_from_unit_name (unit);
+  g_debug ("Assigning app ID \"%s\" to pid %ld which has unit \"%s\"",
+           app_info->id, (long) pid, unit);
+
+#else
+  app_info->id = g_strdup ("");
+#endif /* HAVE_LIBSYSTEMD */
+}
+
 static XdpAppInfo *
-xdp_app_info_new_host (void)
+xdp_app_info_new_host (pid_t pid)
 {
   XdpAppInfo *app_info = xdp_app_info_new (XDP_APP_INFO_KIND_HOST);
-  app_info->id = g_strdup ("");
+  set_appid_from_pid (app_info, pid);
   return app_info;
 }
 
@@ -201,6 +287,14 @@ xdp_app_info_get_id (XdpAppInfo *app_info)
   return app_info->id;
 }
 
+XdpAppInfoKind
+xdp_app_info_get_kind (XdpAppInfo  *app_info)
+{
+  g_return_val_if_fail (app_info != NULL, -1);
+
+  return app_info->kind;
+}
+
 GAppInfo *
 xdp_app_info_load_app_info (XdpAppInfo *app_info)
 {
@@ -233,20 +327,52 @@ xdp_app_info_load_app_info (XdpAppInfo *app_info)
   return G_APP_INFO (g_desktop_app_info_new (desktop_id));
 }
 
+static gboolean
+needs_quoting (const char *arg)
+{
+  while (*arg != 0)
+    {
+      char c = *arg;
+      if (!g_ascii_isalnum (c) &&
+          !(c == '-' || c == '/' || c == '~' ||
+            c == ':' || c == '.' || c == '_' ||
+            c == '=' || c == '@'))
+        return TRUE;
+      arg++;
+    }
+  return FALSE;
+}
+
+static char *
+maybe_quote (const char *arg,
+             gboolean quote_escape)
+{
+  if (!quote_escape || !needs_quoting (arg))
+    return g_strdup (arg);
+  else
+    return g_shell_quote (arg);
+}
+
 char **
 xdp_app_info_rewrite_commandline (XdpAppInfo *app_info,
-                                  const char * const *commandline)
+                                  const char * const *commandline,
+                                  gboolean quote_escape)
 {
+  g_autoptr(GPtrArray) args = NULL;
+
   g_return_val_if_fail (app_info != NULL, NULL);
 
   if (app_info->kind == XDP_APP_INFO_KIND_HOST)
     {
-      return g_strdupv ((char **)commandline);
+      int i;
+      args = g_ptr_array_new_with_free_func (g_free);
+      for (i = 0; commandline && commandline[i]; i++)
+        g_ptr_array_add (args, maybe_quote (commandline[i], quote_escape));
+      g_ptr_array_add (args, NULL);
+      return (char **)g_ptr_array_free (g_steal_pointer (&args), FALSE);
     }
   else if (app_info->kind == XDP_APP_INFO_KIND_FLATPAK)
     {
-      g_autoptr(GPtrArray) args = NULL;
-
       args = g_ptr_array_new_with_free_func (g_free);
 
       g_ptr_array_add (args, g_strdup ("flatpak"));
@@ -254,17 +380,78 @@ xdp_app_info_rewrite_commandline (XdpAppInfo *app_info,
       if (commandline && commandline[0])
         {
           int i;
+          g_autofree char *quoted_command = NULL;
 
-          g_ptr_array_add (args, g_strdup_printf ("--command=%s", commandline[0]));
-          g_ptr_array_add (args, g_strdup (app_info->id));
+          quoted_command = maybe_quote (commandline[0], quote_escape);
+
+          g_ptr_array_add (args, g_strdup_printf ("--command=%s", quoted_command));
+
+          /* Always quote the app ID if quote_escape is enabled to make
+           * rewriting the file simpler in case the app is renamed.
+           */
+          if (quote_escape)
+            g_ptr_array_add (args, g_shell_quote (app_info->id));
+          else
+            g_ptr_array_add (args, g_strdup (app_info->id));
+
           for (i = 1; commandline[i]; i++)
-            g_ptr_array_add (args, g_strdup (commandline[i]));
+            g_ptr_array_add (args, maybe_quote (commandline[i], quote_escape));
         }
       else
-        g_ptr_array_add (args, g_strdup (app_info->id));
+        g_ptr_array_add (args, g_shell_quote (app_info->id));
       g_ptr_array_add (args, NULL);
 
       return (char **)g_ptr_array_free (g_steal_pointer (&args), FALSE);
+    }
+  else
+    return NULL;
+}
+
+char *
+xdp_app_info_get_tryexec_path (XdpAppInfo *app_info)
+{
+  g_return_val_if_fail (app_info != NULL, NULL);
+
+  if (app_info->kind == XDP_APP_INFO_KIND_FLATPAK)
+    {
+      g_autofree char *original_app_path = NULL;
+      g_autofree char *tryexec_path = NULL;
+      g_autofree char *app_slash = NULL;
+      g_autofree char *app_path = NULL;
+      char *app_slash_pointer;
+      char *path;
+
+      original_app_path = g_key_file_get_string (app_info->u.flatpak.keyfile,
+                                                 FLATPAK_METADATA_GROUP_INSTANCE,
+                                                 FLATPAK_METADATA_KEY_ORIGINAL_APP_PATH, NULL);
+      app_path = g_key_file_get_string (app_info->u.flatpak.keyfile,
+                                        FLATPAK_METADATA_GROUP_INSTANCE,
+                                        FLATPAK_METADATA_KEY_APP_PATH, NULL);
+      path = original_app_path ? original_app_path : app_path;
+
+      if (path == NULL || *path == '\0')
+        return NULL;
+
+      app_slash = g_strconcat ("app/", app_info->id, NULL);
+
+      app_slash_pointer = strstr (path, app_slash);
+      if (app_slash_pointer == NULL)
+        return NULL;
+
+      /* Terminate path after the flatpak installation path such as .local/share/flatpak/ */
+      *app_slash_pointer = '\0';
+
+      /* Find the path to the wrapper script exported by Flatpak, which can be
+       * used in a desktop file's TryExec=
+       */
+      tryexec_path = g_strconcat (path, "exports/bin/", app_info->id, NULL);
+      if (access (tryexec_path, X_OK) != 0)
+        {
+          g_debug ("Wrapper script unexpectedly not executable or nonexistent: %s", tryexec_path);
+          return NULL;
+        }
+
+      return g_steal_pointer (&tryexec_path);
     }
   else
     return NULL;
@@ -335,6 +522,9 @@ xdp_app_info_remap_path (XdpAppInfo *app_info,
       else if (g_str_has_prefix (path, "/run/flatpak/app/"))
         return g_build_filename (g_get_user_runtime_dir (), "app",
                                  path + strlen ("/run/flatpak/app/"), NULL);
+      else if (g_str_has_prefix (path, "/run/flatpak/doc/"))
+        return g_build_filename (g_get_user_runtime_dir (), "doc",
+                                 path + strlen ("/run/flatpak/doc/"), NULL);
       else if (g_str_has_prefix (path, "/var/config/"))
         return g_build_filename (g_get_home_dir (), ".var", "app",
                                  app_info->id, "config",
@@ -484,7 +674,7 @@ parse_app_info_from_flatpak_info (int pid, GError **error)
     group = "Runtime";
 
   id = g_key_file_get_string (metadata, group, "name", error);
-  if (id == NULL)
+  if (id == NULL || !xdp_is_valid_app_id (id))
     {
       close (info_fd);
       return NULL;
@@ -523,9 +713,9 @@ _xdp_parse_cgroup_file (FILE *f, gboolean *is_snap)
 
       /* Only consider the freezer, systemd group or unified cgroup
        * hierarchies */
-      if ((!strcmp (controller, "freezer:") != 0 ||
-           !strcmp (controller, "name=systemd:") != 0 ||
-           !strcmp (controller, ":") != 0) &&
+      if ((strcmp (controller, "freezer:") == 0 ||
+           strcmp (controller, "name=systemd:") == 0 ||
+           strcmp (controller, ":") == 0) &&
           strstr (cgroup, "/snap.") != NULL)
         {
           *is_snap = TRUE;
@@ -653,7 +843,7 @@ xdp_get_app_info_from_pid (pid_t pid,
     }
 
   if (app_info == NULL)
-    app_info = xdp_app_info_new_host ();
+    app_info = xdp_app_info_new_host (pid);
 
   return g_steal_pointer (&app_info);
 }
@@ -815,7 +1005,7 @@ xdp_filter_options (GVariant *options,
 
           continue;
         }
-         
+
       if (supported_options[i].validate)
         {
           g_autoptr(GError) local_error = NULL;
@@ -897,7 +1087,7 @@ verify_proc_self_fd (XdpAppInfo *app_info,
   /* File descriptors to actually deleted files have " (deleted)"
      appended to them. This also happens to some fake fd types
      like shmem which are "/<name> (deleted)". All such
-     files are considered invalid. Unfortunatelly this also
+     files are considered invalid. Unfortunately this also
      matches files with filenames that actually end in " (deleted)",
      but there is not much to do about this. */
   if (g_str_has_suffix (path_buffer, " (deleted)"))
@@ -925,6 +1115,9 @@ char *
 xdp_get_alternate_document_path (const char *path, const char *app_id)
 {
   int len;
+
+  if (g_str_equal (app_id, ""))
+    return NULL;
 
   /* If we don't know where the document portal is mounted, then there
    * is no alternate path */
@@ -1210,22 +1403,6 @@ xdp_is_valid_app_id (const char *string)
   return TRUE;
 }
 
-
-static gboolean
-needs_quoting (const char *arg)
-{
-  while (*arg != 0)
-    {
-      char c = *arg;
-      if (!g_ascii_isalnum (c) &&
-          !(c == '-' || c == '/' || c == '~' ||
-            c == ':' || c == '.' || c == '_' ||
-            c == '='))
-        return TRUE;
-      arg++;
-    }
-  return FALSE;
-}
 
 char *
 xdp_quote_argv (const char *argv[])
@@ -1588,7 +1765,7 @@ lookup_ns_from_pid_fd (int    pid_fd,
   struct stat st;
   int r;
 
-  g_return_val_if_fail (ns != NULL, FALSE);
+  g_return_val_if_fail (ns != NULL, -1);
 
   r = fstatat (pid_fd, "ns/pid", &st, 0);
   if (r == -1)
@@ -1820,7 +1997,7 @@ pidfd_to_pid (int fdinfo, const int pidfd, pid_t *pid, GError **error)
 }
 
 static JsonNode *
-xdg_app_info_load_brwap_info (XdpAppInfo *app_info,
+xdp_app_info_load_bwrap_info (XdpAppInfo *app_info,
                               GError    **error)
 {
   g_autoptr(JsonParser) parser = NULL;
@@ -1835,7 +2012,11 @@ xdg_app_info_load_brwap_info (XdpAppInfo *app_info,
   instance = xdp_app_info_get_instance (app_info);
 
   if (instance == NULL)
-    return 0;
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                           "Could not find instance-id in process's /.flatpak-info");
+      return 0;
+    }
 
   path = g_build_filename (g_get_user_runtime_dir (),
                            ".flatpak",
@@ -1879,7 +2060,7 @@ xdp_app_info_get_pid_namespace (JsonNode *root,
   JsonObject *cpo;
   gint64 nsid;
 
-  /* xdg_app_info_load_brwap_info assures root is of type object */
+  /* xdp_app_info_load_bwrap_info assures root is of type object */
   cpo = json_node_get_object (root);
   node = json_object_get_member (cpo, "pid-namespace");
 
@@ -1911,26 +2092,26 @@ xdp_app_info_get_child_pid (JsonNode *root,
   return pid;
 }
 
-#define xdp_lockguard G_GNUC_UNUSED __attribute__((cleanup(xdp_auto_unlock_helper)))
-
 static gboolean
-xdg_app_info_ensure_pidns (XdpAppInfo  *app_info,
+xdp_app_info_ensure_pidns (XdpAppInfo  *app_info,
                            DIR         *proc,
                            GError     **error)
 {
   g_autoptr(JsonNode) root = NULL;
-  xdp_lockguard GMutex *guard = NULL;
+  g_autoptr(GMutexLocker) guard = NULL;
   xdp_autofd int fd = -1;
   pid_t pid;
   ino_t ns;
   int r;
 
-  guard = xdp_auto_lock_helper (app_info->u.flatpak.pidns_lock);
+  g_assert (app_info->kind == XDP_APP_INFO_KIND_FLATPAK);
+
+  guard = g_mutex_locker_new (&(app_info->u.flatpak.pidns_lock));
 
   if (app_info->u.flatpak.pidns_id != 0)
     return TRUE;
 
-  root = xdg_app_info_load_brwap_info (app_info, error);
+  root = xdp_app_info_load_bwrap_info (app_info, error);
   if (root == NULL)
     return FALSE;
 
@@ -1968,13 +2149,13 @@ xdg_app_info_ensure_pidns (XdpAppInfo  *app_info,
   return TRUE;
 }
 
-
-
-gboolean
-xdg_app_info_map_pids (XdpAppInfo  *app_info,
-                       pid_t       *pids,
-                       guint        n_pids,
-                       GError     **error)
+/* This is the trunk for xdp_app_info_map_pids()/xdp_app_info_map_tids() */
+static gboolean
+app_info_map_pids (XdpAppInfo  *app_info,
+                   const char  *proc_dir,
+                   pid_t       *pids,
+                   guint        n_pids,
+                   GError     **error)
 {
   gboolean ok;
   DIR *proc;
@@ -1991,16 +2172,16 @@ xdg_app_info_map_pids (XdpAppInfo  *app_info,
       return FALSE;
     }
 
-  proc = opendir ("/proc");
+  proc = opendir (proc_dir);
   if (proc == NULL)
     {
       g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
-                   "Could not open '/proc: %s", g_strerror (errno));
+                   "Could not open '%s': %s", proc_dir, g_strerror (errno));
       return FALSE;
     }
 
   /* Make sure we know the pid namespace the app is running in */
-  ok = xdg_app_info_ensure_pidns (app_info, proc, error);
+  ok = xdp_app_info_ensure_pidns (app_info, proc, error);
   if (!ok)
     {
       g_prefix_error (error, "Could not determine pid namespace: ");
@@ -2020,8 +2201,29 @@ xdg_app_info_map_pids (XdpAppInfo  *app_info,
   return ok;
 }
 
+
 gboolean
-xdg_app_info_pidfds_to_pids (XdpAppInfo  *app_info,
+xdp_app_info_map_tids (XdpAppInfo  *app_info,
+                       pid_t        owner_pid,
+                       pid_t       *tids,
+                       guint        n_tids,
+                       GError     **error)
+{
+  g_autofree char *proc_dir = g_strdup_printf ("/proc/%u/task", (guint) owner_pid);
+  return app_info_map_pids (app_info, proc_dir, tids, n_tids, error);
+}
+
+gboolean
+xdp_app_info_map_pids (XdpAppInfo  *app_info,
+                       pid_t       *pids,
+                       guint        n_pids,
+                       GError     **error)
+{
+  return app_info_map_pids (app_info, "/proc", pids, n_pids, error);
+}
+
+gboolean
+xdp_app_info_pidfds_to_pids (XdpAppInfo  *app_info,
                              const int   *fds,
                              pid_t       *pids,
                              gint         count,
@@ -2044,4 +2246,164 @@ xdg_app_info_pidfds_to_pids (XdpAppInfo  *app_info,
   (void) close (fdinfo);
 
   return ok;
+}
+
+void
+cleanup_temp_file (void *p)
+{
+  void **pp = (void **)p;
+
+  if (*pp)
+    remove (*pp);
+  g_free (*pp);
+}
+
+#define ICON_VALIDATOR_GROUP "Icon Validator"
+
+gboolean
+xdp_validate_serialized_icon (GVariant  *v,
+                              gboolean   bytes_only,
+                              char     **out_format,
+                              char     **out_size)
+{
+  g_autoptr(GIcon) icon = NULL;
+  GBytes *bytes;
+  __attribute__((cleanup(cleanup_temp_file))) char *name = NULL;
+  xdp_autofd int fd = -1;
+  g_autoptr(GOutputStream) stream = NULL;
+  int status;
+  g_autofree char *format = NULL;
+  g_autofree char *stdoutlog = NULL;
+  g_autofree char *stderrlog = NULL;
+  g_autoptr(GError) error = NULL;
+  const char *icon_validator = LIBEXECDIR "/xdg-desktop-portal-validate-icon";
+  const char *args[6];
+  /* same allowed formats as Flatpak */
+  const char *allowed_icon_formats[] = { "png", "jpeg", "svg", NULL };
+  int size;
+  const char *MAX_ICON_SIZE = "512";
+  gconstpointer bytes_data;
+  gsize bytes_len;
+  g_autoptr(GKeyFile) key_file = NULL;
+
+  icon = g_icon_deserialize (v);
+  if (!icon)
+    {
+      g_warning ("Icon deserialization failed");
+      return FALSE;
+    }
+
+  if (!bytes_only && G_IS_THEMED_ICON (icon))
+    {
+      g_autofree char *a = g_strjoinv (" ", (char **)g_themed_icon_get_names (G_THEMED_ICON (icon)));
+      g_debug ("Icon validation: themed icon (%s) is ok", a);
+      return TRUE;
+    }
+
+  if (!G_IS_BYTES_ICON (icon))
+    {
+      g_warning ("Unexpected icon type: %s", G_OBJECT_TYPE_NAME (icon));
+      return FALSE;
+    }
+
+  if (!g_file_test (icon_validator, G_FILE_TEST_EXISTS))
+    {
+      g_warning ("Icon validation: %s not found, rejecting icon by default.", icon_validator);
+      return FALSE;
+    }
+
+  bytes = g_bytes_icon_get_bytes (G_BYTES_ICON (icon));
+  fd = g_file_open_tmp ("iconXXXXXX", &name, &error);
+  if (fd == -1)
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+
+  stream = g_unix_output_stream_new (fd, FALSE);
+
+  /* Use write_all() instead of write_bytes() so we don't have to worry about
+   * partial writes (https://gitlab.gnome.org/GNOME/glib/-/issues/570).
+   */
+  bytes_data = g_bytes_get_data (bytes, &bytes_len);
+  if (!g_output_stream_write_all (stream, bytes_data, bytes_len, NULL, NULL, &error))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+
+  if (!g_output_stream_close (stream, NULL, &error))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+
+  args[0] = icon_validator;
+  args[1] = "--sandbox";
+  args[2] = MAX_ICON_SIZE;
+  args[3] = MAX_ICON_SIZE;
+  args[4] = name;
+  args[5] = NULL;
+
+  if (!g_spawn_sync (NULL, (char **)args, NULL, 0, NULL, NULL, &stdoutlog, &stderrlog, &status, &error))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      g_warning ("stderr:\n%s\n", stderrlog);
+      return FALSE;
+    }
+
+  if (!g_spawn_check_exit_status (status, &error))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+
+  key_file = g_key_file_new ();
+  if (!g_key_file_load_from_data (key_file, stdoutlog, -1, G_KEY_FILE_NONE, &error))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+  if (!(format = g_key_file_get_string (key_file, ICON_VALIDATOR_GROUP, "format", &error)) ||
+      !g_strv_contains (allowed_icon_formats, format))
+    {
+      g_warning ("Icon validation: %s", error ? error->message : "not allowed format");
+      return FALSE;
+    }
+  if (!(size = g_key_file_get_integer (key_file, ICON_VALIDATOR_GROUP, "width", &error)))
+    {
+      g_warning ("Icon validation: %s", error->message);
+      return FALSE;
+    }
+
+  if (out_format)
+    *out_format = g_steal_pointer (&format);
+  if (out_size)
+    *out_size = g_strdup_printf ("%d", size);
+
+  return TRUE;
+}
+
+gboolean
+xdp_variant_contains_key (GVariant *dictionary,
+                          const char *key)
+{
+  GVariantIter iter;
+
+  g_variant_iter_init (&iter, dictionary);
+  while (TRUE)
+    {
+      g_autoptr(GVariant) entry = NULL;
+      g_autoptr(GVariant) entry_key = NULL;
+
+      entry = g_variant_iter_next_value (&iter);
+      if (!entry)
+        break;
+
+      entry_key = g_variant_get_child_value (entry, 0);
+      if (g_strcmp0 (g_variant_get_string (entry_key, NULL), key) == 0)
+        return TRUE;
+    }
+
+  return FALSE;
 }
