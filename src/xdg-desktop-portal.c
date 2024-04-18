@@ -30,33 +30,39 @@
 #include "xdp-utils.h"
 #include "xdp-dbus.h"
 #include "xdp-impl-dbus.h"
-#include "request.h"
+#include "account.h"
+#include "background.h"
 #include "call.h"
-#include "portal-impl.h"
+#include "camera.h"
+#include "clipboard.h"
+#include "device.h"
 #include "documents.h"
-#include "permissions.h"
+#include "dynamic-launcher.h"
+#include "email.h"
 #include "file-chooser.h"
-#include "open-uri.h"
-#include "print.h"
+#include "gamemode.h"
+#include "global-shortcuts.h"
+#include "inhibit.h"
+#include "input-capture.h"
+#include "location.h"
 #include "memory-monitor.h"
 #include "network-monitor.h"
-#include "power-profile-monitor.h"
-#include "proxy-resolver.h"
-#include "screenshot.h"
 #include "notification.h"
-#include "inhibit.h"
-#include "device.h"
-#include "account.h"
-#include "email.h"
-#include "screen-cast.h"
+#include "open-uri.h"
+#include "permissions.h"
+#include "portal-impl.h"
+#include "power-profile-monitor.h"
+#include "print.h"
+#include "proxy-resolver.h"
+#include "realtime.h"
 #include "remote-desktop.h"
-#include "trash.h"
-#include "location.h"
-#include "settings.h"
-#include "background.h"
-#include "gamemode.h"
-#include "camera.h"
+#include "request.h"
+#include "restore-token.h"
+#include "screen-cast.h"
+#include "screenshot.h"
 #include "secret.h"
+#include "settings.h"
+#include "trash.h"
 #include "wallpaper.h"
 
 static GMainLoop *loop = NULL;
@@ -117,14 +123,42 @@ method_needs_request (GDBusMethodInvocation *invocation)
     }
   else if (strcmp (interface, "org.freedesktop.portal.RemoteDesktop") == 0)
     {
-      if (strstr (method, "Notify") == method)
+      if (strstr (method, "Notify") == method || strcmp (method, "ConnectToEIS") == 0)
         return FALSE;
       else
         return TRUE;
     }
-  if (strcmp (interface, "org.freedesktop.portal.Camera") == 0)
+  else if (strcmp (interface, "org.freedesktop.portal.Clipboard") == 0)
+    {
+      return FALSE;
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.Camera") == 0)
     {
       if (strcmp (method, "OpenPipeWireRemote") == 0)
+        return FALSE;
+      else
+        return TRUE;
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.DynamicLauncher") == 0)
+    {
+      if (strcmp (method, "PrepareInstall") == 0)
+        return TRUE;
+      else
+        return FALSE;
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.Background") == 0)
+    {
+      if (strcmp (method, "SetStatus") == 0)
+        return FALSE;
+      else
+        return TRUE;
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.InputCapture") == 0)
+    {
+      if (strcmp (method, "ConnectToEIS") == 0 ||
+          strcmp (method, "Enable") == 0 ||
+          strcmp (method, "Disable") == 0 ||
+          strcmp (method, "Release") == 0)
         return FALSE;
       else
         return TRUE;
@@ -196,6 +230,7 @@ peer_died_cb (const char *name)
 {
   close_requests_for_sender (name);
   close_sessions_for_sender (name);
+  xdp_session_persistence_delete_transient_permissions_for_sender (name);
 }
 
 static void
@@ -204,9 +239,10 @@ on_bus_acquired (GDBusConnection *connection,
                  gpointer         user_data)
 {
   PortalImplementation *implementation;
-  PortalImplementation *implementation2;
+  PortalImplementation *lockdown_impl;
+  PortalImplementation *access_impl;
   g_autoptr(GError) error = NULL;
-  XdpImplLockdown *lockdown;
+  XdpDbusImplLockdown *lockdown;
   GQuark portal_errors G_GNUC_UNUSED;
   GPtrArray *impls;
 
@@ -217,15 +253,15 @@ on_bus_acquired (GDBusConnection *connection,
   init_document_proxy (connection);
   init_permission_store (connection);
 
-  implementation = find_portal_implementation ("org.freedesktop.impl.portal.Lockdown");
-  if (implementation != NULL)
-    lockdown = xdp_impl_lockdown_proxy_new_sync (connection,
-                                                 G_DBUS_PROXY_FLAGS_NONE,
-                                                 implementation->dbus_name,
-                                                 DESKTOP_PORTAL_OBJECT_PATH,
-                                                 NULL, &error);
+  lockdown_impl = find_portal_implementation ("org.freedesktop.impl.portal.Lockdown");
+  if (lockdown_impl != NULL)
+    lockdown = xdp_dbus_impl_lockdown_proxy_new_sync (connection,
+                                                      G_DBUS_PROXY_FLAGS_NONE,
+                                                      lockdown_impl->dbus_name,
+                                                      DESKTOP_PORTAL_OBJECT_PATH,
+                                                      NULL, &error);
   else
-    lockdown = xdp_impl_lockdown_skeleton_new ();
+    lockdown = xdp_dbus_impl_lockdown_skeleton_new ();
 
   export_portal_implementation (connection, memory_monitor_create (connection));
   export_portal_implementation (connection, power_profile_monitor_create (connection));
@@ -233,6 +269,7 @@ on_bus_acquired (GDBusConnection *connection,
   export_portal_implementation (connection, proxy_resolver_create (connection));
   export_portal_implementation (connection, trash_create (connection));
   export_portal_implementation (connection, game_mode_create (connection));
+  export_portal_implementation (connection, realtime_create (connection));
 
   impls = find_all_portal_implementations ("org.freedesktop.impl.portal.Settings");
   export_portal_implementation (connection, settings_create (connection, impls));
@@ -253,11 +290,6 @@ on_bus_acquired (GDBusConnection *connection,
     export_portal_implementation (connection,
                                   print_create (connection, implementation->dbus_name, lockdown));
 
-  implementation = find_portal_implementation ("org.freedesktop.impl.portal.Screenshot");
-  if (implementation != NULL)
-    export_portal_implementation (connection,
-                                  screenshot_create (connection, implementation->dbus_name));
-
   implementation = find_portal_implementation ("org.freedesktop.impl.portal.Notification");
   if (implementation != NULL)
     export_portal_implementation (connection,
@@ -268,34 +300,46 @@ on_bus_acquired (GDBusConnection *connection,
     export_portal_implementation (connection,
                                   inhibit_create (connection, implementation->dbus_name));
 
-  implementation = find_portal_implementation ("org.freedesktop.impl.portal.Access");
-  implementation2 = find_portal_implementation ("org.freedesktop.impl.portal.Background");
-  if (implementation != NULL)
+  access_impl = find_portal_implementation ("org.freedesktop.impl.portal.Access");
+  if (access_impl != NULL)
     {
+      PortalImplementation *tmp;
+
       export_portal_implementation (connection,
-                                    device_create (connection, implementation->dbus_name, lockdown));
+                                    device_create (connection,
+                                                   access_impl->dbus_name,
+                                                   lockdown));
 #ifdef HAVE_GEOCLUE
       export_portal_implementation (connection,
-                                    location_create (connection, implementation->dbus_name, lockdown));
+                                    location_create (connection,
+                                                     access_impl->dbus_name,
+                                                     lockdown));
 #endif
 
-#ifdef HAVE_PIPEWIRE
-      export_portal_implementation (connection, camera_create (connection, lockdown));
-#endif
+      export_portal_implementation (connection,
+                                    camera_create (connection, lockdown));
+
+      tmp = find_portal_implementation ("org.freedesktop.impl.portal.Screenshot");
+      if (tmp != NULL)
+        export_portal_implementation (connection,
+                                      screenshot_create (connection,
+                                                         access_impl->dbus_name,
+                                                         tmp->dbus_name));
+
+      tmp = find_portal_implementation ("org.freedesktop.impl.portal.Background");
+      if (tmp != NULL)
+        export_portal_implementation (connection,
+                                      background_create (connection,
+                                                         access_impl->dbus_name,
+                                                         tmp->dbus_name));
+
+      tmp = find_portal_implementation ("org.freedesktop.impl.portal.Wallpaper");
+      if (tmp != NULL)
+        export_portal_implementation (connection,
+                                      wallpaper_create (connection,
+                                                        access_impl->dbus_name,
+                                                        tmp->dbus_name));
     }
-
-  if (implementation != NULL && implementation2 != NULL)
-    export_portal_implementation (connection,
-                                  background_create (connection,
-                                                     implementation->dbus_name,
-                                                     implementation2->dbus_name));
-
-  implementation2 = find_portal_implementation ("org.freedesktop.impl.portal.Wallpaper");
-  if (implementation != NULL && implementation2 != NULL)
-    export_portal_implementation (connection,
-                                  wallpaper_create (connection,
-                                                    implementation->dbus_name,
-                                                    implementation2->dbus_name));
 
   implementation = find_portal_implementation ("org.freedesktop.impl.portal.Account");
   if (implementation != NULL)
@@ -310,9 +354,18 @@ on_bus_acquired (GDBusConnection *connection,
   implementation = find_portal_implementation ("org.freedesktop.impl.portal.Secret");
   if (implementation != NULL)
     export_portal_implementation (connection,
-				  secret_create (connection, implementation->dbus_name));
+                                  secret_create (connection, implementation->dbus_name));
 
-#ifdef HAVE_PIPEWIRE
+  implementation = find_portal_implementation ("org.freedesktop.impl.portal.GlobalShortcuts");
+  if (implementation != NULL)
+    export_portal_implementation (connection,
+                                  global_shortcuts_create (connection, implementation->dbus_name));
+
+  implementation = find_portal_implementation ("org.freedesktop.impl.portal.DynamicLauncher");
+  if (implementation != NULL)
+    export_portal_implementation (connection,
+                                  dynamic_launcher_create (connection, implementation->dbus_name));
+
   implementation = find_portal_implementation ("org.freedesktop.impl.portal.ScreenCast");
   if (implementation != NULL)
     export_portal_implementation (connection,
@@ -322,7 +375,16 @@ on_bus_acquired (GDBusConnection *connection,
   if (implementation != NULL)
     export_portal_implementation (connection,
                                   remote_desktop_create (connection, implementation->dbus_name));
-#endif
+
+  implementation = find_portal_implementation ("org.freedesktop.impl.portal.Clipboard");
+  if (implementation != NULL)
+    export_portal_implementation (
+        connection, clipboard_create (connection, implementation->dbus_name));
+
+  implementation = find_portal_implementation ("org.freedesktop.impl.portal.InputCapture");
+  if (implementation != NULL)
+    export_portal_implementation (connection,
+                                  input_capture_create (connection, implementation->dbus_name));
 }
 
 static void
@@ -354,6 +416,9 @@ main (int argc, char *argv[])
   bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
   textdomain (GETTEXT_PACKAGE);
 
+  /* Note: if you add any more environment variables here, update
+   * handle_launch() in dynamic-launcher.c to unset them before launching apps
+   */
   /* Avoid even loading gvfs to avoid accidental confusion */
   g_setenv ("GIO_USE_VFS", "local", TRUE);
 
@@ -396,6 +461,7 @@ main (int argc, char *argv[])
 
   g_set_prgname (argv[0]);
 
+  load_portal_configuration (opt_verbose);
   load_installed_portals (opt_verbose);
 
   loop = g_main_loop_new (NULL, FALSE);

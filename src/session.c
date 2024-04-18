@@ -42,12 +42,12 @@ G_LOCK_DEFINE (sessions);
 static GHashTable *sessions;
 
 static void g_initable_iface_init (GInitableIface *iface);
-static void session_skeleton_iface_init (XdpSessionIface *iface);
+static void session_skeleton_iface_init (XdpDbusSessionIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Session, session, XDP_TYPE_SESSION_SKELETON,
+G_DEFINE_TYPE_WITH_CODE (Session, session, XDP_DBUS_TYPE_SESSION_SKELETON,
                          G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE,
                                                 g_initable_iface_init)
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_SESSION,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_SESSION,
                                                 session_skeleton_iface_init))
 
 #define SESSION_GET_CLASS(o) \
@@ -174,6 +174,20 @@ session_close (Session *session,
 
   SESSION_GET_CLASS (session)->close (session);
 
+  if (notify_closed)
+    {
+      GVariantBuilder details_builder;
+
+      g_variant_builder_init (&details_builder, G_VARIANT_TYPE_VARDICT);
+      g_dbus_connection_emit_signal (session->connection,
+                                     session->sender,
+                                     session->id,
+                                     "org.freedesktop.portal.Session",
+                                     "Closed",
+                                     g_variant_new ("(@a{sv})", g_variant_builder_end (&details_builder)),
+                                     NULL);
+    }
+
   if (session->exported)
     session_unexport (session);
 
@@ -183,8 +197,8 @@ session_close (Session *session,
     {
       g_autoptr(GError) error = NULL;
 
-      if (!xdp_impl_session_call_close_sync (session->impl_session,
-                                             NULL, &error))
+      if (!xdp_dbus_impl_session_call_close_sync (session->impl_session,
+                                                  NULL, &error))
         g_warning ("Failed to close session implementation: %s",
                    error->message);
 
@@ -193,20 +207,12 @@ session_close (Session *session,
 
   session->closed = TRUE;
 
-  if (notify_closed)
-    {
-      GVariantBuilder details_builder;
-
-      g_variant_builder_init (&details_builder, G_VARIANT_TYPE_VARDICT);
-      g_signal_emit_by_name (session, "closed",
-                             g_variant_builder_end (&details_builder));
-    }
 
   g_object_unref (session);
 }
 
 static gboolean
-handle_close (XdpSession *object,
+handle_close (XdpDbusSession *object,
               GDBusMethodInvocation *invocation)
 {
   Session *session = (Session *)object;
@@ -215,13 +221,13 @@ handle_close (XdpSession *object,
 
   session_close (session, FALSE);
 
-  xdp_session_complete_close (object, invocation);
+  xdp_dbus_session_complete_close (object, invocation);
 
   return TRUE;
 }
 
 static void
-session_skeleton_iface_init (XdpSessionIface *iface)
+session_skeleton_iface_init (XdpDbusSessionIface *iface)
 {
   iface->handle_close = handle_close;
 }
@@ -259,6 +265,7 @@ close_sessions_in_thread_func (GTask *task,
     }
 
   g_slist_free_full (list, g_object_unref);
+  g_task_return_boolean (task, TRUE);
 }
 
 void
@@ -272,9 +279,9 @@ close_sessions_for_sender (const char *sender)
 }
 
 static void
-on_closed (XdpImplSession *object)
+on_closed (XdpDbusImplSession *object, GObject *data)
 {
-  Session *session = (Session *)object;
+  Session *session = (Session *)data;
 
   SESSION_AUTOLOCK_UNREF (g_object_ref (session));
 
@@ -310,7 +317,7 @@ session_initable_init (GInitable *initable,
   Session *session = (Session *)initable;
   g_autofree char *sender_escaped = NULL;
   g_autofree char *id = NULL;
-  g_autoptr(XdpImplSession) impl_session = NULL;
+  g_autoptr(XdpDbusImplSession) impl_session = NULL;
   int i;
 
   sender_escaped = g_strdup (session->sender + 1);
@@ -331,15 +338,16 @@ session_initable_init (GInitable *initable,
 
   if (session->impl_dbus_name)
     {
-      impl_session = xdp_impl_session_proxy_new_sync (session->impl_connection,
-                                                      G_DBUS_PROXY_FLAGS_NONE,
-                                                      session->impl_dbus_name,
-                                                      id,
-                                                      NULL, error);
+      impl_session =
+        xdp_dbus_impl_session_proxy_new_sync (session->impl_connection,
+                                              G_DBUS_PROXY_FLAGS_NONE,
+                                              session->impl_dbus_name,
+                                              id,
+                                              NULL, error);
       if (!impl_session)
         return FALSE;
 
-      g_signal_connect (impl_session, "closed", G_CALLBACK (on_closed), NULL);
+      g_signal_connect (impl_session, "closed", G_CALLBACK (on_closed), session);
 
       session->impl_session = g_steal_pointer (&impl_session);
     }
@@ -455,6 +463,7 @@ session_finalize (GObject *object)
 
   g_free (session->app_id);
   g_free (session->id);
+  g_free (session->token);
 
   g_mutex_clear (&session->mutex);
 

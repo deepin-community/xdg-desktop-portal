@@ -36,25 +36,26 @@ typedef struct _SettingsClass SettingsClass;
 
 struct _Settings
 {
-  XdpSettingsSkeleton parent_instance;
+  XdpDbusSettingsSkeleton parent_instance;
 };
 
 struct _SettingsClass
 {
-  XdpSettingsSkeletonClass parent_class;
+  XdpDbusSettingsSkeletonClass parent_class;
 };
 
-static XdpImplSettings **impls;
+static XdpDbusImplSettings **impls;
 static int n_impls = 0;
 
 GType settings_get_type (void) G_GNUC_CONST;
-static void settings_iface_init (XdpSettingsIface *iface);
+static void settings_iface_init (XdpDbusSettingsIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Settings, settings, XDP_TYPE_SETTINGS_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_SETTINGS, settings_iface_init));
+G_DEFINE_TYPE_WITH_CODE (Settings, settings, XDP_DBUS_TYPE_SETTINGS_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_SETTINGS,
+                                                settings_iface_init));
 
 static gboolean
-settings_handle_read_all (XdpSettings           *object,
+settings_handle_read_all (XdpDbusSettings       *object,
                           GDBusMethodInvocation *invocation,
                           const char    * const *arg_namespaces)
 {
@@ -68,7 +69,8 @@ settings_handle_read_all (XdpSettings           *object,
       g_autoptr(GError) error = NULL;
       g_autoptr(GVariant) impl_value = NULL;
 
-      if (!xdp_impl_settings_call_read_all_sync (impls[j], arg_namespaces, &impl_value, NULL, &error))
+      if (!xdp_dbus_impl_settings_call_read_all_sync (impls[j], arg_namespaces,
+                                                      &impl_value, NULL, &error))
         {
           g_warning ("Failed to ReadAll() from Settings implementation: %s", error->message);
         }
@@ -88,11 +90,11 @@ settings_handle_read_all (XdpSettings           *object,
 
   g_dbus_method_invocation_return_value (invocation, g_variant_builder_end (builder));
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static gboolean
-settings_handle_read (XdpSettings           *object,
+settings_handle_read (XdpDbusSettings       *object,
                       GDBusMethodInvocation *invocation,
                       const char            *arg_namespace,
                       const char            *arg_key)
@@ -106,7 +108,8 @@ settings_handle_read (XdpSettings           *object,
       g_autoptr(GError) error = NULL;
       g_autoptr(GVariant) impl_value = NULL;
 
-      if (!xdp_impl_settings_call_read_sync (impls[i], arg_namespace, arg_key, &impl_value, NULL, &error))
+      if (!xdp_dbus_impl_settings_call_read_sync (impls[i], arg_namespace,
+                                                  arg_key, &impl_value, NULL, &error))
         {
           /* A key not being found is expected, continue to our implementation */
           g_debug ("Failed to Read() from Settings implementation: %s", error->message);
@@ -114,7 +117,7 @@ settings_handle_read (XdpSettings           *object,
       else
         {
           g_dbus_method_invocation_return_value (invocation, g_variant_new ("(v)", impl_value));
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         }
     }
 
@@ -123,31 +126,69 @@ settings_handle_read (XdpSettings           *object,
                                                  XDG_DESKTOP_PORTAL_ERROR_NOT_FOUND,
                                                  _("Requested setting not found"));
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
+}
+
+static gboolean
+settings_handle_read_one (XdpDbusSettings       *object,
+                          GDBusMethodInvocation *invocation,
+                          const char            *arg_namespace,
+                          const char            *arg_key)
+{
+  int i;
+
+  g_debug ("ReadOne %s %s", arg_namespace, arg_key);
+
+  for (i = 0; i < n_impls; i++)
+    {
+      g_autoptr(GError) error = NULL;
+      g_autoptr(GVariant) impl_value = NULL;
+
+      if (!xdp_dbus_impl_settings_call_read_sync (impls[i], arg_namespace,
+                                                  arg_key, &impl_value, NULL, &error))
+        {
+          /* A key not being found is expected, continue to our implementation */
+          g_debug ("Failed to Read() from Settings implementation: %s", error->message);
+        }
+      else
+        {
+          g_dbus_method_invocation_return_value (invocation, g_variant_new_tuple (&impl_value, 1));
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
+        }
+    }
+
+  g_debug ("Attempted to read unknown namespace/key pair: %s %s", arg_namespace, arg_key);
+  g_dbus_method_invocation_return_error_literal (invocation, XDG_DESKTOP_PORTAL_ERROR,
+                                                 XDG_DESKTOP_PORTAL_ERROR_NOT_FOUND,
+                                                 _("Requested setting not found"));
+
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-on_impl_settings_changed (XdpImplSettings *impl,
-                          const char      *arg_namespace,
-                          const char      *arg_key,
-                          GVariant        *arg_value,
-                          XdpSettings     *settings)
+on_impl_settings_changed (XdpDbusImplSettings *impl,
+                          const char          *arg_namespace,
+                          const char          *arg_key,
+                          GVariant            *arg_value,
+                          XdpDbusSettings     *settings)
 {
   g_debug ("Emitting changed for %s %s", arg_namespace, arg_key);
-  xdp_settings_emit_setting_changed (settings, arg_namespace, arg_key, arg_value);
+  xdp_dbus_settings_emit_setting_changed (settings, arg_namespace,
+                                          arg_key, arg_value);
 }
 
 static void
-settings_iface_init (XdpSettingsIface *iface)
+settings_iface_init (XdpDbusSettingsIface *iface)
 {
   iface->handle_read = settings_handle_read;
+  iface->handle_read_one = settings_handle_read_one;
   iface->handle_read_all = settings_handle_read_all;
 }
 
 static void
-settings_init (Settings *self)
+settings_init (Settings *settings)
 {
-  xdp_settings_set_version (XDP_SETTINGS (self), 1);
+  xdp_dbus_settings_set_version (XDP_DBUS_SETTINGS (settings), 2);
 }
 
 static void
@@ -180,7 +221,7 @@ settings_create (GDBusConnection *connection,
   int n_impls_tmp;
 
   n_impls_tmp = implementations->len;
-  impls = g_new (XdpImplSettings *, n_impls_tmp);
+  impls = g_new (XdpDbusImplSettings *, n_impls_tmp);
 
   settings = g_object_new (settings_get_type (), NULL);
 
@@ -189,12 +230,13 @@ settings_create (GDBusConnection *connection,
       PortalImplementation *impl = g_ptr_array_index (implementations, i);
       const char *dbus_name = impl->dbus_name;
 
-      XdpImplSettings *impl_proxy = xdp_impl_settings_proxy_new_sync (connection,
-                                                                      G_DBUS_PROXY_FLAGS_NONE,
-                                                                      dbus_name,
-                                                                      DESKTOP_PORTAL_OBJECT_PATH,
-                                                                      NULL,
-                                                                      &error);
+      XdpDbusImplSettings *impl_proxy =
+        xdp_dbus_impl_settings_proxy_new_sync (connection,
+                                               G_DBUS_PROXY_FLAGS_NONE,
+                                               dbus_name,
+                                               DESKTOP_PORTAL_OBJECT_PATH,
+                                               NULL,
+                                               &error);
       if (impl_proxy == NULL)
         {
           g_warning ("Failed to create settings proxy: %s", error->message);

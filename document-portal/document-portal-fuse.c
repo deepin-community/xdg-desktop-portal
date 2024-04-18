@@ -1,6 +1,28 @@
+/*
+ * Copyright © 2018 Red Hat, Inc
+ * Copyright © 2023 GNOME Foundation Inc.
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library. If not, see <http://www.gnu.org/licenses/>.
+ *
+ * Authors:
+ *       Alexander Larsson <alexl@redhat.com>
+ *       Hubert Figuière <hub@figuiere.net>
+ */
+
 #include "config.h"
 
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 35
 
 #include <glib-unix.h>
 
@@ -14,9 +36,19 @@
 #include <glib/gprintf.h>
 #include <gio/gio.h>
 #include <pthread.h>
+#ifdef HAVE_SYS_STATFS_H
 #include <sys/statfs.h>
+#endif
 #include <sys/types.h>
+#ifdef HAVE_SYS_MOUNT_H
+#include <sys/mount.h>
+#endif
+#ifdef HAVE_SYS_XATTR_H
 #include <sys/xattr.h>
+#endif
+#ifdef HAVE_SYS_EXTATTR_H
+#include <sys/extattr.h>
+#endif
 #include <sys/time.h>
 #include <sys/resource.h>
 
@@ -28,6 +60,10 @@
 #define O_FSYNC O_SYNC
 #endif
 
+#ifndef ENODATA
+#define ENODATA ENOATTR
+#endif
+
 /* Inode ownership model
  *
  * The document portal exposes something as a filesystem that it
@@ -36,22 +72,22 @@
  * we won't be told about this. This means that in general we always
  * return 0 for the cacheable lifetimes of entries and file attributes.
  * (Except for the virtual directories we have full control of, the
- * below only discusses real files).
+ * section below only discusses real files).
  *
  * However, even though we don't have full control of the underlying
- * filesystem the *kernel* has. This means we can used that to get
+ * filesystem the *kernel* has. This means we can use that to get
  * the correct semantics.
  *
- * For example, assume that a directory is held opened by a process
- * (for example, it could be the CWD of the process). When we opened
- * the directory via a LOOKUP operation we returned an inode to it,
- * and for as long as the kernel has this inode around (i.e.  until it
- * sent a FORGET message) it can send operations on this inode without
- * looking it up again. For example if the above process used a
+ * For example, assume that a directory is held open by a process
+ * (for example, it could be the CWD of the process). When we open
+ * the directory via a LOOKUP operation we return an inode to it,
+ * and, for as long as the kernel has this inode around (i.e.  until it
+ * sent a FORGET message), it can send operations on this inode without
+ * looking it up again. For example, if the above process used a
  * relative path.
  *
  * Now, consider the case where the app chdir():ed into the fuse
- * directory, but after that the backing directory was renamed ouside
+ * directory, but after the backing directory was renamed outside
  * the fuse filesystem. The fuse inode representation for the inode
  * cannot be the directory name, because the expected semantics is
  * that further relative pathnames from the app will still resolve
@@ -70,11 +106,11 @@
  *
  * One problem with this approach is that the kernel tends to keep
  * inodes alive for a very long time even if they are *only*
- * references by the dcache (event though we will not really use the
- * dcache info due to the 0 valid time). This is unfortunate, because
- * it means we will keep a lot of file descriptor open. But, we
- * can't know if the kernel needs the inode for some non-dcache use
- * so we can't close the file descriptors.
+ * referenced by the dcache (Directory Entry Cache) (even though we
+ * will not really use the dcache info due to the 0 valid time). This
+ * is unfortunate, because it means we will keep a lot of file
+ * descriptor open. But, we can not know if the kernel needs the inode
+ * for some non-dcache use so we can't close the file descriptors.
  *
  * To work around this we regularly emit entry invalidation calls
  * to the kernel, which will make it forget the inodes that are
@@ -88,7 +124,7 @@
 
 static GThread *fuse_thread = NULL;
 static struct fuse_session *session = NULL;
-static struct fuse_chan *main_ch = NULL;
+G_LOCK_DEFINE (session);
 static char *mount_path = NULL;
 static pthread_t fuse_pthread = 0;
 static uid_t my_uid;
@@ -138,8 +174,6 @@ struct _XdpDomain {
   guint64 doc_dir_device;
   guint64 doc_dir_inode;
   guint32 doc_flags;
-
-  int doc_queued_invalidate; /* Access atomically, 1 if queued invalidate */
 
   /* Below is mutable, protected by mutex */
   GMutex  tempfile_mutex;
@@ -209,6 +243,14 @@ typedef struct {
 XdpInode *root_inode;
 XdpInode *by_app_inode;
 
+typedef struct {
+  ino_t parent_ino;
+  char name[0];
+} XdpInvalidateData;
+
+static GList *invalidate_list;
+G_LOCK_DEFINE (invalidate_list);
+
 static XdpInode *xdp_inode_ref (XdpInode *inode);
 static void xdp_inode_unref (XdpInode *inode);
 
@@ -224,13 +266,15 @@ static int ensure_docdir_inode (XdpInode *parent,
                                 struct fuse_entry_param *e,
                                 XdpInode **inode_out);
 
+static void queue_invalidate_dentry (XdpInode *parent, const char *name);
+
 static gboolean
 app_can_write_doc (PermissionDbEntry *entry, const char *app_id)
 {
   if (app_id == NULL)
     return TRUE;
 
-  if (document_entry_has_permissions (entry, app_id, DOCUMENT_PERMISSION_FLAGS_WRITE))
+  if (document_entry_has_permissions_by_app_id (entry, app_id, DOCUMENT_PERMISSION_FLAGS_WRITE))
     return TRUE;
 
   return FALSE;
@@ -242,7 +286,7 @@ app_can_see_doc (PermissionDbEntry *entry, const char *app_id)
   if (app_id == NULL)
     return TRUE;
 
-  if (document_entry_has_permissions (entry, app_id, DOCUMENT_PERMISSION_FLAGS_READ))
+  if (document_entry_has_permissions_by_app_id (entry, app_id, DOCUMENT_PERMISSION_FLAGS_READ))
     return TRUE;
 
   return FALSE;
@@ -286,8 +330,10 @@ open_flags_to_string (int flags)
     g_string_append (s, ",ASYNC");
   if (flags & O_FSYNC)
     g_string_append (s, ",FSYNC");
+#ifdef O_DSYNC
   if (flags & O_DSYNC)
     g_string_append (s, ",DSYNC");
+#endif
   if (flags & O_CREAT)
     g_string_append (s, ",CREAT");
   if (flags & O_TRUNC)
@@ -298,16 +344,22 @@ open_flags_to_string (int flags)
     g_string_append (s, ",CLOEXEC");
   if (flags & O_DIRECT)
     g_string_append (s, ",DIRECT");
+#ifdef O_LARGEFILE
   if (flags & O_LARGEFILE)
     g_string_append (s, ",LARGEFILE");
+#endif
+#ifdef O_NOATIME
   if (flags & O_NOATIME)
     g_string_append (s, ",NOATIME");
+#endif
   if (flags & O_NOCTTY)
     g_string_append (s, ",NOCTTY");
   if (flags & O_PATH)
     g_string_append (s, ",PATH");
+#ifdef O_TMPFILE
   if (flags & O_TMPFILE)
     g_string_append (s, ",TMPFILE");
+#endif
 
   return g_string_free (s, FALSE);
 }
@@ -347,6 +399,31 @@ setattr_flags_to_string (int flags)
     g_string_truncate (s, s->len - 1);
 
   return g_string_free (s, FALSE);
+}
+
+static char *
+renameat2_flags_to_string (int flags)
+{
+#if HAVE_RENAMEAT2
+  GString *s = g_string_new ("");
+
+  if (flags & RENAME_EXCHANGE)
+    g_string_append (s, "EXCHANGE,");
+
+  if (flags & RENAME_NOREPLACE)
+    g_string_append (s, "NOREPLACE,");
+
+  if (flags & RENAME_WHITEOUT)
+    g_string_append (s, "WHITEOUT,");
+
+  /* Remove last comma */
+  if (s->len > 0)
+    g_string_truncate (s, s->len - 1);
+
+  return g_string_free (s, FALSE);
+#else
+  return g_strdup_printf ("%#x", flags);
+#endif
 }
 
 static guint
@@ -662,11 +739,12 @@ _xdp_inode_new (void)
   return inode;
 }
 
-/* We try to create persistent inode nr based on the backing device and inode nrs, as
- * well as the doc/app id (since the same backing dev/ino should be different inodes
- * in the fuse filesystem). We do this by hashing the data to generate a value.
- * For non-phsyical files or accidental collisions we just pick a free number
- * by incrementing.
+/* We try to create persistent inode number based on the backing
+ * device and inode numbers, as well as the doc/app id (since the same
+ * backing dev/ino should be different inodes in the fuse
+ * filesystem). We do this by hashing the data to generate a value.
+ * For non-physical files or accidental collisions we just pick a free
+ * number by incrementing.
  */
 static guint64
 generate_persistent_ino (DevIno *backing_devino,
@@ -1013,6 +1091,8 @@ get_tempfile_for (XdpInode *parent,
   /* This is atomic, because we're called with the lock held */
   g_hash_table_replace (domain->tempfiles, tempfile->name, xdp_tempfile_ref (tempfile));
 
+  queue_invalidate_dentry (parent, tempfile->name);
+
   if (tempfile_out)
     *tempfile_out = g_steal_pointer (&tempfile);
   return 0;
@@ -1059,6 +1139,8 @@ create_tempfile (XdpInode *parent,
 
   /* This is atomic, because we're called with the lock held */
   g_hash_table_replace (domain->tempfiles, tempfile->name, xdp_tempfile_ref (tempfile));
+
+  queue_invalidate_dentry (parent, tempfile->name);
 
   if (tempfile_out)
     *tempfile_out = g_steal_pointer (&tempfile);
@@ -1230,6 +1312,13 @@ xdp_reply_err (const char *op, fuse_req_t req, int err)
         g_debug ("%s -> error %d", op, err);
     }
   fuse_reply_err (req, err);
+}
+
+static inline void
+xdp_reply_ok (const char *op,
+              fuse_req_t  req)
+{
+  xdp_reply_err (op, req, 0);
 }
 
 typedef enum {
@@ -1598,7 +1687,7 @@ ensure_docdir_inode_by_name (XdpInode *parent,
   if (o_path_fd == -1)
       return -errno;
 
-  return ensure_docdir_inode (parent, o_path_fd, e, NULL); /* Takes ownershif of o_path_fd */
+  return ensure_docdir_inode (parent, o_path_fd, e, NULL); /* Takes ownership of o_path_fd */
 }
 
 
@@ -1659,35 +1748,53 @@ ensure_doc_inode (XdpInode *parent,
 }
 
 static gboolean
-invalidate_doc_domain (gpointer user_data)
+invalidate_dentry_cb (gpointer user_data)
 {
-  g_autoptr(XdpDomain) doc_domain = user_data;
-  ino_t parent_ino;
+  GList *to_invalidate = NULL;
+  {
+    XDP_AUTOLOCK (invalidate_list);
+    to_invalidate = g_steal_pointer (&invalidate_list);
+  }
+  to_invalidate = g_list_reverse (to_invalidate);
 
-  g_atomic_int_set (&doc_domain->doc_queued_invalidate, 0);
+  XDP_AUTOLOCK (session);
+  for (GList *l = to_invalidate; l != NULL; l = l->next)
+    {
+      XdpInvalidateData *data = l->data;
+      if (session)
+        fuse_lowlevel_notify_inval_entry (session, data->parent_ino, data->name,
+                                          strlen (data->name));
+      g_free (data);
+    }
 
-  parent_ino = xdp_inode_to_ino (doc_domain->parent_inode);
-
-  if (g_atomic_int_get (&doc_domain->parent_inode->kernel_ref_count) > 0 && main_ch != NULL)
-    fuse_lowlevel_notify_inval_entry (main_ch, parent_ino, doc_domain->doc_id, strlen (doc_domain->doc_id));
+  g_list_free (to_invalidate);
 
   return FALSE;
 }
 
-/* Queue an inval_entry call on this domain, thereby freeing all unused inodes
- * in the dcache which will free up a bunch of O_PATH fds in the fuse implementation
+/* Queue an inval_dentry, thereby freeing unused inodes in the dcache
+ * which will free up a bunch of O_PATH fds in the fuse implementation.
  */
 static void
-doc_domain_queue_entry_invalidate (XdpDomain *doc_domain)
+queue_invalidate_dentry (XdpInode *parent, const char *name)
 {
-  int old = g_atomic_int_get (&doc_domain->doc_queued_invalidate);
-  if (old != 0)
-    return;
+  XDP_AUTOLOCK (invalidate_list);
 
-  if (!g_atomic_int_compare_and_exchange (&doc_domain->doc_queued_invalidate, old, 1))
-    return; // Someone else set it to 1, return
+  for (GList *l = invalidate_list; l != NULL; l = l->next)
+    {
+      XdpInvalidateData *data = l->data;
+      if (data->parent_ino == parent->ino && strcmp (name, data->name) == 0)
+        return;
+    }
 
-  g_timeout_add (1000, invalidate_doc_domain, xdp_domain_ref (doc_domain));
+  XdpInvalidateData *data = g_malloc0 (sizeof (XdpInvalidateData) + strlen (name) + 1);
+  data->parent_ino = parent->ino;
+  strcpy (data->name, name);
+
+  if (invalidate_list == NULL)
+    g_timeout_add (10, invalidate_dentry_cb, NULL);
+
+  invalidate_list = g_list_append (invalidate_list, data);
 }
 
 static void
@@ -1746,11 +1853,11 @@ xdp_fuse_lookup (fuse_req_t req,
       if (fd < 0)
         return xdp_reply_err (op, req, -fd);
 
-      res = ensure_docdir_inode (parent, fd, &e, NULL); /* Takes ownershif of fd */
+      res = ensure_docdir_inode (parent, fd, &e, NULL); /* Takes ownership of fd */
       if (res != 0)
         return xdp_reply_err (op, req, -res);
 
-      doc_domain_queue_entry_invalidate (parent_domain);
+      queue_invalidate_dentry (parent, name);
     }
 
   g_debug ("LOOKUP %lx:%s => %lx", parent_ino, name, e.ino);
@@ -1799,6 +1906,29 @@ xdp_fuse_open (fuse_req_t req,
     return;
 
   path = fd_to_path (inode->physical->fd);
+
+  /*
+   * `path` is a path to the fd entry in `/proc`, which is a symlink
+   * to the actual file. Opening it directly with `O_NOFOLLOW` will
+   * fail. So we should resolve it first then we can honour the no
+   * follow flag.
+   */
+  if (open_flags & O_NOFOLLOW)
+    {
+      char resolved_path[PATH_MAX] = { 0, };
+      ssize_t res;
+
+      res = readlink (path, resolved_path, sizeof (resolved_path));
+
+      if (res == sizeof (resolved_path))
+        return xdp_reply_err (op, req, ENAMETOOLONG);
+      if (res < 0)
+        return xdp_reply_err (op, req, errno);
+
+      g_clear_pointer (&path, g_free);
+      path = g_strdup (resolved_path);
+    }
+
   fd = open (path, open_flags, 0);
   if (fd == -1)
     return xdp_reply_err (op, req, errno);
@@ -1808,7 +1938,7 @@ xdp_fuse_open (fuse_req_t req,
   fi->fh = (gsize)file;
   if (fuse_reply_open (req, fi) == -ENOENT)
     {
-      /* The open syscall was interrupted, so it  must be cancelled */
+      /* The open syscall was interrupted, so it must be cancelled */
       xdp_file_free (file);
     }
 }
@@ -1847,7 +1977,7 @@ xdp_fuse_create (fuse_req_t             req,
   if (o_path_fd < 0)
     return xdp_reply_err (op, req, errno);
 
-  res = ensure_docdir_inode (parent, xdp_steal_fd (&o_path_fd), &e, NULL); /* Takes ownershif of o_path_fd */
+  res = ensure_docdir_inode (parent, xdp_steal_fd (&o_path_fd), &e, NULL); /* Takes ownership of o_path_fd */
   if (res != 0)
     return xdp_reply_err (op, req, -res);
 
@@ -1856,10 +1986,12 @@ xdp_fuse_create (fuse_req_t             req,
   fi->fh = (gsize)file;
   if (fuse_reply_create (req, &e, fi) == -ENOENT)
     {
-      /* The open syscall was interrupted, so it  must be cancelled */
+      /* The open syscall was interrupted, so it must be cancelled */
       xdp_file_free (file);
       abort_reply_entry (&e);
     }
+
+  queue_invalidate_dentry (parent, filename);
 }
 
 static void
@@ -1946,7 +2078,7 @@ xdp_fuse_fsync (fuse_req_t             req,
   else
     res = fsync (file->fd);
   if (res == 0)
-    xdp_reply_err (op, req, 0);
+    xdp_reply_ok (op, req);
   else
     xdp_reply_err (op, req, errno);
 }
@@ -1965,10 +2097,14 @@ xdp_fuse_fallocate (fuse_req_t req,
 
   g_debug ("FALLOCATE %lx", ino);
 
+#ifdef __linux__
   res = fallocate (file->fd, mode, offset, length);
+#else
+  res = posix_fallocate (file->fd, offset, length);
+#endif
 
   if (res == 0)
-    xdp_reply_err (op, req, 0);
+    xdp_reply_ok (op, req);
   else
     xdp_reply_err (op, req, errno);
 }
@@ -1981,7 +2117,7 @@ xdp_fuse_flush (fuse_req_t req,
   const char *op = "FLUSH";
 
   g_debug ("FLUSH %lx", ino);
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
 
 static void
@@ -1996,7 +2132,7 @@ xdp_fuse_release (fuse_req_t             req,
 
   xdp_file_free (file);
 
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
 
 static void
@@ -2012,7 +2148,7 @@ forget_one (fuse_ino_t ino,
 static void
 xdp_fuse_forget (fuse_req_t req,
                  fuse_ino_t ino,
-                 unsigned long nlookup)
+                 uint64_t nlookup)
 {
   forget_one (ino, nlookup);
   fuse_reply_none (req);
@@ -2228,7 +2364,7 @@ xdp_fuse_opendir (fuse_req_t             req,
 
   if (fuse_reply_open (req, fi) == -ENOENT)
     {
-      /* The opendir syscall was interrupted, so it  must be cancelled */
+      /* The opendir syscall was interrupted, so it must be cancelled */
       xdp_dir_free (d);
     }
 }
@@ -2241,7 +2377,6 @@ xdp_fuse_readdir (fuse_req_t req,
                   struct fuse_file_info *fi)
 {
   XdpDir *d = (XdpDir *)fi->fh;
-  char *p;
   size_t rem;
   const char *op = "READDIR";
 
@@ -2249,6 +2384,7 @@ xdp_fuse_readdir (fuse_req_t req,
 
   if (d->dir)
     {
+      char *p;
       g_autofree char *buf = g_try_malloc (size);
 
       if (buf == NULL)
@@ -2296,7 +2432,7 @@ xdp_fuse_readdir (fuse_req_t req,
                                        d->entry->d_name, &st, nextoff);
           /* The above function returns the size of the entry size even though
            * the copy failed due to smaller buf size, so I'm checking after this
-           * function and breaking out incase we exceed the size.
+           * function and breaking out in case we exceed the size.
            */
           if (entsize > rem)
             break;
@@ -2335,7 +2471,7 @@ xdp_fuse_releasedir (fuse_req_t             req,
 
   xdp_dir_free (d);
 
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
 
 static void
@@ -2362,7 +2498,7 @@ xdp_fuse_fsyncdir (fuse_req_t             req,
     res = 0;
 
   if (res == 0)
-    xdp_reply_err (op, req, 0);
+    xdp_reply_ok (op, req);
   else
     xdp_reply_err (op, req, errno);
 }
@@ -2396,7 +2532,7 @@ xdp_fuse_mkdir (fuse_req_t  req,
   if (res != 0)
     return xdp_reply_err (op, req, errno);
 
-  res = ensure_docdir_inode_by_name (parent, dirfd, name, &e); /* Takes ownershif of o_path_fd */
+  res = ensure_docdir_inode_by_name (parent, dirfd, name, &e); /* Takes ownership of o_path_fd */
   if (res != 0)
     return xdp_reply_err (op, req, -res);
 
@@ -2457,18 +2593,42 @@ xdp_fuse_unlink (fuse_req_t  req,
         }
     }
 
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
+
+static int
+try_renameat (int olddirfd,
+              const char *oldpath,
+              int newdirfd,
+              const char *newpath,
+              unsigned int flags)
+{
+#if HAVE_RENAMEAT2
+  return renameat2 (olddirfd, oldpath, newdirfd, newpath, flags);
+#else
+  if (flags)
+    {
+      g_warning ("renameat2 is not supported by this system and rename flags are set");
+      errno = EINVAL;
+      return -1;
+    }
+
+  return renameat (olddirfd, oldpath, newdirfd, newpath);
+#endif
+}
+
 
 static void
 xdp_fuse_rename (fuse_req_t  req,
                  fuse_ino_t  parent_ino,
                  const char *name,
                  fuse_ino_t  newparent_ino,
-                 const char *newname)
+                 const char *newname,
+                 unsigned int flags)
 {
   g_autoptr(XdpInode) parent = xdp_inode_from_ino (parent_ino);
   g_autoptr(XdpInode) newparent = xdp_inode_from_ino (newparent_ino);
+  g_autofree char *rename_flags_string = renameat2_flags_to_string (flags);
   XdpDomain *domain;
   int res, errsv;
   int olddirfd, newdirfd, dirfd;
@@ -2476,7 +2636,8 @@ xdp_fuse_rename (fuse_req_t  req,
   xdp_autofd int close_fd2 = -1;
   const char *op = "RENAME";
 
-  g_debug ("RENAME %lx %s -> %lx %s", parent_ino, name, newparent_ino, newname);
+  g_debug ("RENAME %lx %s -> %lx %s (flags: %s)", parent_ino, name,
+           newparent_ino, newname, rename_flags_string);
 
   if (!xdp_document_inode_checks (op, req, parent,
                                   CHECK_CAN_WRITE |
@@ -2498,11 +2659,11 @@ xdp_fuse_rename (fuse_req_t  req,
       if (newdirfd < 0)
         return xdp_reply_err (op, req, -newdirfd);
 
-      res = renameat (olddirfd, name, newdirfd, newname);
+      res = try_renameat (olddirfd, name, newdirfd, newname, flags);
       if (res != 0)
         return xdp_reply_err (op, req, errno);
 
-      xdp_reply_err (op, req, 0);
+      xdp_reply_ok (op, req);
     }
   else
     {
@@ -2512,7 +2673,7 @@ xdp_fuse_rename (fuse_req_t  req,
 
       /* Early exit for same file */
       if (strcmp (name, newname) == 0)
-        return xdp_reply_err (op, req, 0);
+        return xdp_reply_ok (op, req);
 
       dirfd = xdp_nonphysical_document_inode_opendir (parent);
       if (dirfd < 0)
@@ -2532,7 +2693,7 @@ xdp_fuse_rename (fuse_req_t  req,
           close (tmp_fd);
 
           g_mutex_lock (&domain->tempfile_mutex);
-          res = renameat (dirfd, name, dirfd, tmpname);
+          res = try_renameat (dirfd, name, dirfd, tmpname, flags);
           if (res == -1)
             {
               res = -errno;
@@ -2549,7 +2710,7 @@ xdp_fuse_rename (fuse_req_t  req,
           if (res != 0)
             return xdp_reply_err (op, req, -res);
 
-          xdp_reply_err (op, req, 0);
+          xdp_reply_ok (op, req);
         }
       else if (strcmp (newname, domain->doc_file) == 0)
         {
@@ -2563,7 +2724,7 @@ xdp_fuse_rename (fuse_req_t  req,
             {
               XdpTempfile *tempfile = stolen_value;
 
-              res = renameat (dirfd, tempfile->tempname, dirfd, newname);
+              res = try_renameat (dirfd, tempfile->tempname, dirfd, newname, flags);
               errsv = errno;
 
               if (res == -1) /* Revert tempfile steal */
@@ -2586,7 +2747,7 @@ xdp_fuse_rename (fuse_req_t  req,
           if (res != 0)
             return xdp_reply_err (op, req, errsv);
 
-          xdp_reply_err (op, req, 0);
+          xdp_reply_ok (op, req);
         }
       else
         {
@@ -2614,7 +2775,7 @@ xdp_fuse_rename (fuse_req_t  req,
           if (!found_tempfile)
             return xdp_reply_err (op, req, ENOENT);
 
-          xdp_reply_err (op, req, 0);
+          xdp_reply_ok (op, req);
         }
     }
 }
@@ -2634,11 +2795,9 @@ xdp_fuse_access (fuse_req_t req,
   if (inode->domain->type != XDP_DOMAIN_DOCUMENT)
     {
       if (mask & W_OK)
-        xdp_reply_err (op, req, EPERM);
+        return xdp_reply_err (op, req, EPERM);
       else
-        xdp_reply_err (op, req, 0);
-
-      return;
+        return xdp_reply_ok (op, req);
     }
 
   if ((mask & W_OK) != 0 &&
@@ -2666,7 +2825,7 @@ xdp_fuse_access (fuse_req_t req,
   if (res == -1)
     xdp_reply_err (op, req, errno);
   else
-    xdp_reply_err (op, req, 0);
+    xdp_reply_ok (op, req);
 }
 
 static void
@@ -2694,9 +2853,9 @@ xdp_fuse_rmdir (fuse_req_t req,
 
   res = unlinkat (dirfd, filename, AT_REMOVEDIR);
   if (res != 0)
-    xdp_reply_err (op, req, errno);
+    return xdp_reply_err (op, req, errno);
 
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
 
 static void
@@ -2755,7 +2914,7 @@ xdp_fuse_symlink (fuse_req_t req,
   if (res != 0)
     return xdp_reply_err (op, req, errno);
 
-  res = ensure_docdir_inode_by_name (parent, dirfd, name, &e); /* Takes ownershif of o_path_fd */
+  res = ensure_docdir_inode_by_name (parent, dirfd, name, &e); /* Takes ownership of o_path_fd */
   if (res != 0)
     return xdp_reply_err (op, req, -res);
 
@@ -2856,12 +3015,18 @@ xdp_fuse_setxattr (fuse_req_t req,
     return;
 
   path = fd_to_path (inode->physical->fd);
+#if defined(HAVE_SYS_XATTR_H)
   res = setxattr (path, name, value, size, flags);
+#elif defined(HAVE_SYS_EXTATTR_H)
+  res = extattr_set_file (path, EXTATTR_NAMESPACE_USER, name, value, size);
+#else
+#error "Not implemented for your platform"
+#endif
 
   if (res < 0)
     return xdp_reply_err (op, req, errno);
 
-  xdp_reply_err (op, req, 0);
+  xdp_reply_ok (op, req);
 }
 
 static void
@@ -2888,7 +3053,15 @@ xdp_fuse_getxattr (fuse_req_t req,
   if (path == NULL)
     res = ENODATA;
   else
+  {
+#if defined(HAVE_SYS_XATTR_H)
     res = getxattr (path, name, buf, size);
+#elif defined(HAVE_SYS_EXTATTR_H)
+    res = extattr_get_file (path, EXTATTR_NAMESPACE_USER, name, buf, size);
+#else
+#error "Not implemented for your platform"
+#endif
+  }
   if (res < 0)
     return xdp_reply_err (op, req, errno);
 
@@ -2919,7 +3092,15 @@ xdp_fuse_listxattr (fuse_req_t req,
 
   path = xdp_document_inode_get_self_as_path (inode);
   if (path)
+  {
+#if defined(HAVE_SYS_XATTR_H)
     res = listxattr (path, buf, size);
+#elif defined(HAVE_SYS_EXTATTR_H)
+    res = extattr_list_file (path, EXTATTR_NAMESPACE_USER, buf, size);
+#else
+#error "Not implemented for your platform"
+#endif
+  }
   else
     res = 0;
 
@@ -2951,12 +3132,18 @@ xdp_fuse_removexattr (fuse_req_t req,
     return;
 
   path = fd_to_path (inode->physical->fd);
+#if defined(HAVE_SYS_XATTR_H)
   res = removexattr (path, name);
+#elif defined(HAVE_SYS_EXTATTR_H)
+  res = extattr_delete_file (path, EXTATTR_NAMESPACE_USER, name);
+#else
+#error "Not implemented for your platform"
+#endif
 
   if (res < 0)
     xdp_reply_err (op, req, errno);
   else
-    xdp_reply_err (op, req, 0);
+    xdp_reply_ok (op, req);
 }
 
 static void
@@ -2966,10 +3153,16 @@ xdp_fuse_getlk (fuse_req_t req,
                 struct flock *lock)
 {
   const char *op = "GETLK";
+  XdpFile *file = (XdpFile *)fi->fh;
+  int res;
 
   g_debug ("GETLK %lx", ino);
 
-  xdp_reply_err (op, req, ENOSYS);
+  res = fcntl (file->fd, F_GETLK, lock);
+  if (res < 0)
+    return xdp_reply_err (op, req, errno);
+
+  return xdp_reply_ok (op, req);
 }
 
 static void
@@ -2980,10 +3173,16 @@ xdp_fuse_setlk (fuse_req_t req,
                 int sleep)
 {
   const char *op = "SETLK";
+  XdpFile *file = (XdpFile *)fi->fh;
+  int res;
 
   g_debug ("SETLK %lx", ino);
 
-  xdp_reply_err (op, req, ENOSYS);
+  res = fcntl (file->fd, F_SETLK, lock);
+  if (res < 0)
+    return xdp_reply_err (op, req, errno);
+
+  return xdp_reply_ok (op, req);
 }
 
 static void
@@ -3004,20 +3203,26 @@ xdp_fuse_init_cb (void                  *userdata,
                   struct fuse_conn_info *conn)
 {
   g_debug ("INIT");
+
+  /* splice_read: use splice() to read from fuse pipe */
+  conn->want |= FUSE_CAP_SPLICE_READ;
+  /* splice_write: use splice() to write to fuse pipe */
+  conn->want |= FUSE_CAP_SPLICE_WRITE;
+  /* splice_move: move buffers from writing app to kernel during splice write */
+  conn->want |= FUSE_CAP_SPLICE_MOVE;
+  /* atomic_o_trunc: We handle O_TRUNC in create() */
+  conn->want |= FUSE_CAP_ATOMIC_O_TRUNC;
 }
 
-extern void on_fuse_unmount (void);
-
-static int destroyed;
+extern gboolean on_fuse_unmount (void *);
 
 static void
 xdp_fuse_destroy_cb (void *userdata)
 {
   g_debug ("DESTROY");
 
-  destroyed = 1;
-
-  on_fuse_unmount ();
+  /* Ensure we call this on the main thread */
+  g_idle_add ((GSourceFunc) on_fuse_unmount, NULL);
 }
 
 static struct fuse_lowlevel_ops xdp_fuse_oper = {
@@ -3059,14 +3264,19 @@ static struct fuse_lowlevel_ops xdp_fuse_oper = {
  .fallocate    = xdp_fuse_fallocate,
 };
 
-static gpointer
-xdp_fuse_mainloop (gpointer data)
+typedef struct {
+  GMutex lock;
+  GCond cond;
+  GError *error;
+} XdpFuseThreadData;
+
+static void
+xdp_fuse_mainloop (struct fuse_session *se,
+                   struct fuse_loop_config *loop_config)
 {
   const char *status;
 
-  fuse_pthread = pthread_self ();
-
-  fuse_session_loop_mt (session);
+  fuse_session_loop_mt (se, loop_config);
 
   status = getenv ("TEST_DOCUMENT_PORTAL_FUSE_STATUS");
   if (status)
@@ -3079,11 +3289,79 @@ xdp_fuse_mainloop (gpointer data)
       g_file_set_contents (status, s->str, -1, &error);
       g_assert_no_error (error);
     }
+}
 
-  fuse_session_remove_chan (main_ch);
-  fuse_session_destroy (session);
-  fuse_unmount (mount_path, main_ch);
-  main_ch = NULL;
+typedef struct fuse_args XdpAutoFuseArgs;
+G_DEFINE_AUTO_CLEANUP_CLEAR_FUNC (XdpAutoFuseArgs, fuse_opt_free_args);
+
+static gpointer
+xdp_fuse_thread (gpointer data)
+{
+  /* Options:
+   *  auto_unmount: Tell fusermount to auto unmount if we die.
+   */
+  static char *fusermount_argv[] = {
+    "xdp-fuse", "-osubtype=portal,fsname=portal,auto_unmount",
+  };
+  g_auto(XdpAutoFuseArgs) args =
+    FUSE_ARGS_INIT (G_N_ELEMENTS (fusermount_argv), fusermount_argv);
+  g_autoptr(GMutexLocker) locker = NULL;
+  g_autoptr(GMutexLocker) session_locker = NULL;
+  const char *path;
+  struct fuse_session *se;
+  XdpFuseThreadData *thread_data = data;
+  struct fuse_cmdline_opts opts = {0};
+  struct fuse_loop_config loop_config = {0};
+
+  locker = g_mutex_locker_new (&thread_data->lock);
+  fuse_pthread = pthread_self ();
+
+  g_cond_signal (&thread_data->cond);
+
+  if (fuse_parse_cmdline (&args, &opts) != 0)
+    {
+      g_set_error (&thread_data->error, XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "Impossible to parse command line");
+      return NULL;
+    }
+
+  se = fuse_session_new (&args, &xdp_fuse_oper,
+                         sizeof (xdp_fuse_oper), NULL);
+  if (se == NULL)
+    {
+      g_set_error (&thread_data->error, XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                   "Can't create fuse session");
+      return NULL;
+    }
+
+  path = xdp_fuse_get_mountpoint ();
+  if (fuse_session_mount (se, path) != 0)
+    {
+      fuse_session_destroy (se);
+      g_set_error (&thread_data->error, XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                   "Can't mount path %s", path);
+      return NULL;
+    }
+
+  session = se;
+  thread_data = NULL;
+  g_clear_pointer (&locker, g_mutex_locker_free);
+
+  loop_config.clone_fd = opts.clone_fd;
+  loop_config.max_idle_threads = opts.max_idle_threads;
+  thread_data = NULL;
+
+  session_locker = g_mutex_locker_new (&G_LOCK_NAME (session));
+  g_clear_pointer (&session_locker, g_mutex_locker_free);
+  xdp_fuse_mainloop (session, &loop_config);
+
+  session_locker = g_mutex_locker_new (&G_LOCK_NAME (session));
+  fuse_session_unmount (se);
+  fuse_session_destroy (se);
+  session = NULL;
 
   return NULL;
 }
@@ -3091,16 +3369,7 @@ xdp_fuse_mainloop (gpointer data)
 gboolean
 xdp_fuse_init (GError **error)
 {
-  /* Options:
-   *  auto_unmount: Tell fusermount to auto unmount if we die.
-   *  splice_read: use splice() to read from fuse pipe
-   *  splice_write: use splice() to write to fuse pipe
-   *  splice_move: move buffers from writing app to kernel during splice write
-   *  atomic_o_trunc: We handle O_TRUNC in create()
-   *  big_writes: Allow > 4k writes
-   */
-  char *fusermount_argv[] = { "xdp-fuse", "-osubtype=portal,fsname=portal,auto_unmount,splice_read,splice_write,splice_move,atomic_o_trunc,big_writes" };
-  struct fuse_args args = FUSE_ARGS_INIT (G_N_ELEMENTS (fusermount_argv), fusermount_argv);
+  XdpFuseThreadData thread_data = {0};
   struct stat st;
   struct statfs stfs;
   const char *path;
@@ -3137,7 +3406,7 @@ xdp_fuse_init (GError **error)
        (statfs_res == 0 && stfs.f_type == 0x65735546 /* fuse */)))
     {
       int count;
-      char *umount_argv[] = { "fusermount", "-u", "-z", (char *) path, NULL };
+      char *umount_argv[] = { "fusermount3", "-u", "-z", (char *) path, NULL };
 
       g_spawn_sync (NULL, umount_argv, NULL, G_SPAWN_SEARCH_PATH,
                     NULL, NULL, NULL, NULL, NULL, NULL);
@@ -3155,29 +3424,27 @@ xdp_fuse_init (GError **error)
       return FALSE;
     }
 
-  main_ch = fuse_mount (path, &args);
-  if (main_ch == NULL)
+  g_mutex_init (&thread_data.lock);
+  g_cond_init (&thread_data.cond);
+
+  g_mutex_lock (&thread_data.lock);
+  XDP_AUTOLOCK (session);
+  fuse_thread = g_thread_new ("fuse mainloop", xdp_fuse_thread, &thread_data);
+
+  while (session == NULL && thread_data.error == NULL)
+    g_cond_wait (&thread_data.cond, &thread_data.lock);
+
+  g_mutex_unlock (&thread_data.lock);
+  g_cond_clear (&thread_data.cond);
+  g_mutex_clear (&thread_data.lock);
+
+  if (thread_data.error != NULL)
     {
-      fuse_opt_free_args (&args);
-      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
-                   "Can't mount fuse fs on %s: %s", path, g_strerror (errno));
+      g_propagate_error (error, g_steal_pointer (&thread_data.error));
       return FALSE;
     }
 
-  session = fuse_lowlevel_new (&args, &xdp_fuse_oper,
-                               sizeof (xdp_fuse_oper), NULL);
-  if (session == NULL)
-    {
-      fuse_opt_free_args (&args);
-      g_set_error (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_FAILED,
-                   "Can't create fuse session");
-      return FALSE;
-    }
-  fuse_session_add_chan (session, main_ch);
-
-  fuse_thread = g_thread_new ("fuse mainloop", xdp_fuse_mainloop, session);
-
-  fuse_opt_free_args (&args);
+  g_assert (session != NULL);
 
   return TRUE;
 }
@@ -3185,14 +3452,18 @@ xdp_fuse_init (GError **error)
 void
 xdp_fuse_exit (void)
 {
-  if (!destroyed && session)
-    fuse_session_exit (session);
+  {
+    XDP_AUTOLOCK (session);
 
-  if (fuse_pthread)
-    pthread_kill (fuse_pthread, SIGHUP);
+    if (session)
+      fuse_session_exit (session);
 
-  if (fuse_thread)
-    g_thread_join (fuse_thread);
+    if (fuse_pthread)
+      pthread_kill (fuse_pthread, SIGHUP);
+  }
+
+  g_clear_pointer (&fuse_thread, g_thread_join);
+  g_assert (session == NULL);
 }
 
 const char *
@@ -3239,11 +3510,12 @@ xdp_fuse_invalidate_doc_app (const char *doc_id,
                              const char *opt_app_id)
 {
   g_autoptr(GArray) invalidates = NULL;
+  XDP_AUTOLOCK (session);
   int i;
 
   /* This can happen if fuse is not initialized yet for the very
      first dbus message that activated the service */
-  if (main_ch == NULL)
+  if (session == NULL)
     return;
 
   g_debug ("invalidate %s/%s", doc_id, opt_app_id ? opt_app_id : "*");
@@ -3276,12 +3548,12 @@ xdp_fuse_invalidate_doc_app (const char *doc_id,
 
       if (invalidate->filename)
         {
-          fuse_lowlevel_notify_inval_entry (main_ch, invalidate->ino,
+          fuse_lowlevel_notify_inval_entry (session, invalidate->ino,
                                             invalidate->filename, strlen (invalidate->filename));
           g_free (invalidate->filename);
         }
       else
-        fuse_lowlevel_notify_inval_inode (main_ch, invalidate->ino, 0, 0);
+        fuse_lowlevel_notify_inval_inode (session, invalidate->ino, 0, 0);
     }
 }
 
