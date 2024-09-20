@@ -46,23 +46,24 @@ typedef struct _DeviceClass DeviceClass;
 
 struct _Device
 {
-  XdpDeviceSkeleton parent_instance;
+  XdpDbusDeviceSkeleton parent_instance;
 };
 
 struct _DeviceClass
 {
-  XdpDeviceSkeletonClass parent_class;
+  XdpDbusDeviceSkeletonClass parent_class;
 };
 
-static XdpImplAccess *impl;
+static XdpDbusImplAccess *impl;
 static Device *device;
-static XdpImplLockdown *lockdown;
+static XdpDbusImplLockdown *lockdown;
 
 GType device_get_type (void) G_GNUC_CONST;
-static void device_iface_init (XdpDeviceIface *iface);
+static void device_iface_init (XdpDbusDeviceIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Device, device, XDP_TYPE_DEVICE_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_DEVICE, device_iface_init));
+G_DEFINE_TYPE_WITH_CODE (Device, device, XDP_DBUS_TYPE_DEVICE_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_DEVICE,
+                                                device_iface_init));
 
 static const char *known_devices[] = {
   "microphone",
@@ -97,7 +98,7 @@ device_query_permission_sync (const char *app_id,
       g_autoptr(GVariant) results = NULL;
       g_autoptr(GError) error = NULL;
       g_autoptr(GAppInfo) info = NULL;
-      g_autoptr(XdpImplRequest) impl_request = NULL;
+      g_autoptr(XdpDbusImplRequest) impl_request = NULL;
 
       if (app_id[0] != 0)
         {
@@ -148,11 +149,11 @@ device_query_permission_sync (const char *app_id,
             subtitle = g_strdup_printf (_("%s wants to use your camera."), g_app_info_get_display_name (info));
         }
 
-      impl_request = xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                                      G_DBUS_PROXY_FLAGS_NONE,
-                                                      g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                                      request->id,
-                                                      NULL, &error);
+      impl_request = xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                                           G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                                                           g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                                           request->id,
+                                                           NULL, &error);
       if (!impl_request)
         return FALSE;
 
@@ -160,20 +161,24 @@ device_query_permission_sync (const char *app_id,
 
       g_debug ("Calling backend for device access to: %s", device);
 
-      if (!xdp_impl_access_call_access_dialog_sync (impl,
-                                                    request->id,
-                                                    app_id,
-                                                    "",
-                                                    title,
-                                                    subtitle,
-                                                    body,
-                                                    g_variant_builder_end (&opt_builder),
-                                                    &response,
-                                                    &results,
-                                                    NULL,
-                                                    &error))
+      if (!xdp_dbus_impl_access_call_access_dialog_sync (impl,
+                                                         request->id,
+                                                         app_id,
+                                                         "",
+                                                         title,
+                                                         subtitle,
+                                                         body,
+                                                         g_variant_builder_end (&opt_builder),
+                                                         &response,
+                                                         &results,
+                                                         NULL,
+                                                         &error))
         {
           g_warning ("A backend call failed: %s", error->message);
+          /* We do not want to set the permission if there was an error and the
+           * permission was UNSET. Setting a permission should only be done from
+           * user input. */
+          return FALSE;
         }
 
       allowed = response == 0;
@@ -210,15 +215,16 @@ handle_access_device_in_thread (GTask *task,
       GVariantBuilder results;
 
       g_variant_builder_init (&results, G_VARIANT_TYPE_VARDICT);
-      xdp_request_emit_response (XDP_REQUEST (request),
-                                 allowed ? XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS : XDG_DESKTOP_PORTAL_RESPONSE_CANCELLED,
-                                 g_variant_builder_end (&results));
+      xdp_dbus_request_emit_response (XDP_DBUS_REQUEST (request),
+                                      allowed ? XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS
+                                              : XDG_DESKTOP_PORTAL_RESPONSE_CANCELLED,
+                                      g_variant_builder_end (&results));
       request_unexport (request);
     }
 }
 
 static gboolean
-handle_access_device (XdpDevice *object,
+handle_access_device (XdpDbusDevice *object,
                       GDBusMethodInvocation *invocation,
                       guint32 pid,
                       const char * const *devices,
@@ -227,7 +233,7 @@ handle_access_device (XdpDevice *object,
   Request *request = request_from_invocation (invocation);
   g_autoptr(XdpAppInfo) app_info = NULL;
   g_autoptr(GError) error = NULL;
-  g_autoptr(XdpImplRequest) impl_request = NULL;
+  g_autoptr(XdpDbusImplRequest) impl_request = NULL;
   g_autoptr(GTask) task = NULL;
 
   if (g_strv_length ((char **)devices) != 1 || !g_strv_contains (known_devices, devices[0]))
@@ -236,38 +242,38 @@ handle_access_device (XdpDevice *object,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                              "Invalid devices requested");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   if (g_str_equal (devices[0], "microphone") &&
-      xdp_impl_lockdown_get_disable_microphone (lockdown))
+      xdp_dbus_impl_lockdown_get_disable_microphone (lockdown))
     {
       g_debug ("Microphone access disabled");
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Microphone access disabled");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
   if (g_str_equal (devices[0], "camera") &&
-      xdp_impl_lockdown_get_disable_camera (lockdown))
+      xdp_dbus_impl_lockdown_get_disable_camera (lockdown))
     {
       g_debug ("Camera access disabled");
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Camera access disabled");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
   if (g_str_equal (devices[0], "speakers") &&
-      xdp_impl_lockdown_get_disable_sound_output (lockdown))
+      xdp_dbus_impl_lockdown_get_disable_sound_output (lockdown))
     {
       g_debug ("Speaker access disabled");
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Speaker access disabled");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   REQUEST_AUTOLOCK (request);
@@ -278,7 +284,7 @@ handle_access_device (XdpDevice *object,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "This call is not available inside the sandbox");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   app_info = xdp_get_app_info_from_pid (pid, &error);
@@ -288,37 +294,37 @@ handle_access_device (XdpDevice *object,
                                              XDG_DESKTOP_PORTAL_ERROR,
                                              XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                              "Invalid pid requested");
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   g_object_set_data_full (G_OBJECT (request), "app-id", g_strdup (xdp_app_info_get_id (app_info)), g_free);
   g_object_set_data_full (G_OBJECT (request), "device", g_strdup (devices[0]), g_free);
 
-  impl_request = xdp_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
-                                                  G_DBUS_PROXY_FLAGS_NONE,
-                                                  g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
-                                                  request->id,
-                                                  NULL, &error);
+  impl_request = xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+                                                       G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
+                                                       g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                                       request->id,
+                                                       NULL, &error);
   if (!impl_request)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   request_set_impl_request (request, impl_request);
   request_export (request, g_dbus_method_invocation_get_connection (invocation));
 
-  xdp_device_complete_access_device (object, invocation, request->id);
+  xdp_dbus_device_complete_access_device (object, invocation, request->id);
 
   task = g_task_new (object, NULL, NULL, NULL);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_access_device_in_thread);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-device_iface_init (XdpDeviceIface *iface)
+device_iface_init (XdpDbusDeviceIface *iface)
 {
   iface->handle_access_device = handle_access_device;
 }
@@ -326,7 +332,7 @@ device_iface_init (XdpDeviceIface *iface)
 static void
 device_init (Device *device)
 {
-  xdp_device_set_version (XDP_DEVICE (device), 1);
+  xdp_dbus_device_set_version (XDP_DBUS_DEVICE (device), 1);
 }
 
 static void
@@ -343,12 +349,12 @@ device_create (GDBusConnection *connection,
 
   lockdown = lockdown_proxy;
 
-  impl = xdp_impl_access_proxy_new_sync (connection,
-                                         G_DBUS_PROXY_FLAGS_NONE,
-                                         dbus_name,
-                                         DESKTOP_PORTAL_OBJECT_PATH,
-                                         NULL,
-                                         &error);
+  impl = xdp_dbus_impl_access_proxy_new_sync (connection,
+                                              G_DBUS_PROXY_FLAGS_NONE,
+                                              dbus_name,
+                                              DESKTOP_PORTAL_OBJECT_PATH,
+                                              NULL,
+                                              &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create access proxy: %s", error->message);

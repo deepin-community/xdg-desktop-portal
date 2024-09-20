@@ -24,18 +24,19 @@
 
 #include <string.h>
 
-static void request_skeleton_iface_init (XdpRequestIface *iface);
+static void request_skeleton_iface_init (XdpDbusRequestIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Request, request, XDP_TYPE_REQUEST_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_REQUEST, request_skeleton_iface_init))
+G_DEFINE_TYPE_WITH_CODE (Request, request, XDP_DBUS_TYPE_REQUEST_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_REQUEST,
+                                                request_skeleton_iface_init))
 
 static void
-request_on_signal_response (XdpRequest *object,
+request_on_signal_response (XdpDbusRequest *object,
                             guint arg_response,
                             GVariant *arg_results)
 {
   Request *request = (Request *)object;
-  XdpRequestSkeleton *skeleton = XDP_REQUEST_SKELETON (object);
+  XdpDbusRequestSkeleton *skeleton = XDP_DBUS_REQUEST_SKELETON (object);
   GList      *connections, *l;
   GVariant   *signal_variant;
 
@@ -60,7 +61,7 @@ request_on_signal_response (XdpRequest *object,
 }
 
 static gboolean
-handle_close (XdpRequest *object,
+handle_close (XdpDbusRequest *object,
               GDBusMethodInvocation *invocation)
 {
   Request *request = (Request *)object;
@@ -72,24 +73,25 @@ handle_close (XdpRequest *object,
   if (request->exported)
     {
       if (request->impl_request &&
-          !xdp_impl_request_call_close_sync (request->impl_request, NULL, &error))
+          !xdp_dbus_impl_request_call_close_sync (request->impl_request,
+                                                  NULL, &error))
         {
           if (invocation)
             g_dbus_method_invocation_return_gerror (invocation, error);
-          return TRUE;
+          return G_DBUS_METHOD_INVOCATION_HANDLED;
         }
 
       request_unexport (request);
     }
 
   if (invocation)
-    xdp_request_complete_close (XDP_REQUEST (request), invocation);
+    xdp_dbus_request_complete_close (XDP_DBUS_REQUEST (request), invocation);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
-request_skeleton_iface_init (XdpRequestIface *iface)
+request_skeleton_iface_init (XdpDbusRequestIface *iface)
 {
   iface->handle_close = handle_close;
   iface->response = request_on_signal_response;
@@ -200,6 +202,10 @@ get_token (GDBusMethodInvocation *invocation)
       else if (strcmp (method, "CreateMonitor") == 0)
         options = g_variant_get_child_value (parameters, 1);
     }
+  else if (strcmp (interface, "org.freedesktop.portal.InputCapture") == 0)
+    {
+      options = g_variant_get_child_value (parameters, 1);
+    }
   else if (strcmp (interface, "org.freedesktop.portal.NetworkMonitor") == 0)
     {
       // no methods
@@ -267,6 +273,10 @@ get_token (GDBusMethodInvocation *invocation)
                      interface, method, G_STRLOC);
         }
     }
+  else if (strcmp (interface, "org.freedesktop.portal.Clipboard") == 0)
+    {
+      // no request objects
+    }
   else if (strcmp (interface, "org.freedesktop.portal.Location") == 0)
     {
       if (strcmp (method, "CreateSession") == 0 )
@@ -295,6 +305,10 @@ get_token (GDBusMethodInvocation *invocation)
     {
       // no request objects
     }
+  else if (strcmp (interface, "org.freedesktop.portal.Realtime") == 0)
+    {
+      // no request objects
+    }
   else if (strcmp (interface, "org.freedesktop.portal.Trash") == 0)
     {
       // no request objects
@@ -304,6 +318,13 @@ get_token (GDBusMethodInvocation *invocation)
         if (strcmp (method, "RequestBackground") == 0 )
           {
             options = g_variant_get_child_value (parameters, 1);
+          }
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.DynamicLauncher") == 0)
+    {
+        if (strcmp (method, "PrepareInstall") == 0 )
+          {
+            options = g_variant_get_child_value (parameters, 3);
           }
     }
   else if (strcmp (interface, "org.freedesktop.portal.Wallpaper") == 0)
@@ -316,7 +337,7 @@ get_token (GDBusMethodInvocation *invocation)
         {
           options = g_variant_get_child_value (parameters, 0);
         }
-      else if (strcmp (method, "OpenPipewireRemote") == 0)
+      else if (strcmp (method, "OpenPipeWireRemote") == 0)
         {
           // no request objects
         }
@@ -329,6 +350,26 @@ get_token (GDBusMethodInvocation *invocation)
   else if (strcmp (interface, "org.freedesktop.portal.Secret") == 0)
     {
       options = g_variant_get_child_value (parameters, 1);
+    }
+  else if (strcmp (interface, "org.freedesktop.portal.GlobalShortcuts") == 0)
+    {
+      if (strcmp (method, "CreateSession") == 0 )
+        {
+          options = g_variant_get_child_value (parameters, 0);
+        }
+      else if (strcmp (method, "BindShortcuts") == 0 )
+        {
+          options = g_variant_get_child_value (parameters, 3);
+        }
+      else if (strcmp (method, "ListShortcuts") == 0 )
+        {
+          options = g_variant_get_child_value (parameters, 1);
+        }
+      else
+        {
+          g_warning ("Support for %s::%s missing in %s",
+                     interface, method, G_STRLOC);
+        }
     }
   else
     {
@@ -430,7 +471,7 @@ request_unexport (Request *request)
 
 void
 request_set_impl_request (Request *request,
-                          XdpImplRequest *impl_request)
+                          XdpDbusImplRequest *impl_request)
 {
   g_set_object (&request->impl_request, impl_request);
 }
@@ -468,13 +509,14 @@ close_requests_in_thread_func (GTask        *task,
       if (request->exported)
         {
           if (request->impl_request)
-            xdp_impl_request_call_close_sync (request->impl_request, NULL, NULL);
+            xdp_dbus_impl_request_call_close_sync (request->impl_request, NULL, NULL);
 
           request_unexport (request);
         }
     }
 
   g_slist_free_full (list, g_object_unref);
+  g_task_return_boolean (task, TRUE);
 }
 
 void

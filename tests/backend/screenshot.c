@@ -5,13 +5,13 @@
 
 #include <gio/gio.h>
 
-#include "src/xdp-impl-dbus.h"
+#include "xdp-impl-dbus.h"
 
 #include "request.h"
 #include "screenshot.h"
 
 typedef struct {
-  XdpImplScreenshot *impl;
+  XdpDbusImplScreenshot *impl;
   GDBusMethodInvocation *invocation;
   Request *request;
   GKeyFile *keyfile;
@@ -38,6 +38,7 @@ send_response (gpointer data)
 {
   ScreenshotHandle *handle = data;
   GVariantBuilder opt_builder;
+  g_autoptr(GVariant) params = NULL;
   int response;
   g_autofree char *uri = NULL;
   double red, green, blue;
@@ -70,16 +71,17 @@ send_response (gpointer data)
 
   g_debug ("send response %d", response);
 
+  params = g_variant_ref_sink (g_variant_builder_end (&opt_builder));
   if (handle->is_screenshot)
-    xdp_impl_screenshot_complete_screenshot (handle->impl,
-                                             handle->invocation,
-                                             response,
-                                             g_variant_builder_end (&opt_builder));
+    xdp_dbus_impl_screenshot_complete_screenshot (handle->impl,
+                                                  handle->invocation,
+                                                  response,
+                                                  params);
   else
-    xdp_impl_screenshot_complete_pick_color (handle->impl,
-                                             handle->invocation,
-                                             response,
-                                             g_variant_builder_end (&opt_builder));
+    xdp_dbus_impl_screenshot_complete_pick_color (handle->impl,
+                                                  handle->invocation,
+                                                  response,
+                                                  params);
 
   handle->timeout = 0;
 
@@ -89,7 +91,7 @@ send_response (gpointer data)
 }
 
 static gboolean
-handle_close (XdpImplRequest *object,
+handle_close (XdpDbusImplRequest *object,
               GDBusMethodInvocation *invocation,
               ScreenshotHandle *handle)
 {
@@ -98,15 +100,15 @@ handle_close (XdpImplRequest *object,
   g_variant_builder_init (&opt_builder, G_VARIANT_TYPE_VARDICT);
   g_debug ("handling Close");
   if (handle->is_screenshot)
-    xdp_impl_screenshot_complete_screenshot (handle->impl,
-                                             handle->invocation,
-                                             2,
-                                             g_variant_builder_end (&opt_builder));
+    xdp_dbus_impl_screenshot_complete_screenshot (handle->impl,
+                                                  handle->invocation,
+                                                  2,
+                                                  g_variant_builder_end (&opt_builder));
   else
-    xdp_impl_screenshot_complete_pick_color (handle->impl,
-                                             handle->invocation,
-                                             2,
-                                             g_variant_builder_end (&opt_builder));
+    xdp_dbus_impl_screenshot_complete_pick_color (handle->impl,
+                                                  handle->invocation,
+                                                  2,
+                                                  g_variant_builder_end (&opt_builder));
 
   screenshot_handle_free (handle);
 
@@ -115,7 +117,7 @@ handle_close (XdpImplRequest *object,
 
 
 static gboolean
-handle_screenshot (XdpImplScreenshot *object,
+handle_screenshot (XdpDbusImplScreenshot *object,
                    GDBusMethodInvocation *invocation,
                    const char *arg_handle,
                    const char *arg_app_id,
@@ -180,8 +182,9 @@ screenshot_init (GDBusConnection *connection,
   g_autoptr(GError) error = NULL;
   GDBusInterfaceSkeleton *helper;
 
-  helper = G_DBUS_INTERFACE_SKELETON (xdp_impl_screenshot_skeleton_new ());
+  helper = G_DBUS_INTERFACE_SKELETON (xdp_dbus_impl_screenshot_skeleton_new ());
 
+  xdp_dbus_impl_screenshot_set_version (XDP_DBUS_IMPL_SCREENSHOT (helper), 2);
   g_signal_connect (helper, "handle-screenshot", G_CALLBACK (handle_screenshot), NULL);
   g_signal_connect (helper, "handle-pick-color", G_CALLBACK (handle_screenshot), NULL);
 

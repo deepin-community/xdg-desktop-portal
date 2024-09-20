@@ -29,7 +29,6 @@
 #include "request.h"
 #include "permissions.h"
 #include "xdp-dbus.h"
-#include "xdp-dbus.h"
 #include "xdp-utils.h"
 
 #define PERMISSION_TABLE "notifications"
@@ -40,15 +39,15 @@ typedef struct _NotificationClass NotificationClass;
 
 struct _Notification
 {
-  XdpNotificationSkeleton parent_instance;
+  XdpDbusNotificationSkeleton parent_instance;
 };
 
 struct _NotificationClass
 {
-  XdpNotificationSkeletonClass parent_class;
+  XdpDbusNotificationSkeletonClass parent_class;
 };
 
-static XdpImplNotification *impl;
+static XdpDbusImplNotification *impl;
 static Notification *notification;
 G_LOCK_DEFINE (active);
 static GHashTable *active;
@@ -99,10 +98,12 @@ pair_copy (Pair *o)
 }
 
 GType notification_get_type (void) G_GNUC_CONST;
-static void notification_iface_init (XdpNotificationIface *iface);
+static void notification_iface_init (XdpDbusNotificationIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (Notification, notification, XDP_TYPE_NOTIFICATION_SKELETON,
-                         G_IMPLEMENT_INTERFACE (XDP_TYPE_NOTIFICATION, notification_iface_init));
+G_DEFINE_TYPE_WITH_CODE (Notification, notification,
+                         XDP_DBUS_TYPE_NOTIFICATION_SKELETON,
+                         G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_NOTIFICATION,
+                                                notification_iface_init));
 
 static void
 add_done (GObject *source,
@@ -112,8 +113,9 @@ add_done (GObject *source,
   g_autoptr(Request) request = data;
   g_autoptr(GError) error = NULL;
 
-  if (!xdp_impl_notification_call_add_notification_finish (impl, result, &error))
+  if (!xdp_dbus_impl_notification_call_add_notification_finish (impl, result, &error))
     {
+      g_dbus_error_strip_remote_error (error);
       g_warning ("Backend call failed: %s", error->message);
     }
   else
@@ -344,96 +346,6 @@ check_notification (GVariant *notification,
   return TRUE;
 }
 
-static void
-cleanup_temp_file (void *p)
-{
-  void **pp = (void **)p;
-
-  if (*pp)
-    remove (*pp);
-  g_free (*pp);
-}
-
-static gboolean
-validate_icon_more (GVariant *v)
-{
-  g_autoptr(GIcon) icon = g_icon_deserialize (v);
-  GBytes *bytes;
-  __attribute__((cleanup(cleanup_temp_file))) char *name = NULL;
-  int fd = -1;
-  g_autoptr(GOutputStream) stream = NULL;
-  gssize written;
-  int status;
-  g_autofree char *err = NULL;
-  g_autoptr(GError) error = NULL;
-  const char *icon_validator = LIBEXECDIR "/flatpak-validate-icon";
-  const char *args[6];
-
-  if (G_IS_THEMED_ICON (icon))
-    {
-      g_autofree char *a = g_strjoinv (" ", (char **)g_themed_icon_get_names (G_THEMED_ICON (icon)));
-      g_debug ("Icon validation: themed icon (%s) is ok", a);
-      return TRUE;
-    }
-
-  if (!G_IS_BYTES_ICON (icon))
-    {
-      g_warning ("Unexpected icon type: %s", G_OBJECT_TYPE_NAME (icon));
-      return FALSE;
-    }
-
-  if (!g_file_test (icon_validator, G_FILE_TEST_EXISTS))
-    {
-      g_debug ("Icon validation: %s not found, accepting icon without further validation.", icon_validator);
-      return TRUE;
-    }
-
-  bytes = g_bytes_icon_get_bytes (G_BYTES_ICON (icon));
-  fd = g_file_open_tmp ("iconXXXXXX", &name, &error); 
-  if (fd == -1)
-    {
-      g_debug ("Icon validation: %s", error->message);
-      return FALSE;
-    }
-
-  stream = g_unix_output_stream_new (fd, TRUE);
-  written = g_output_stream_write_bytes (stream, bytes, NULL, &error);
-  if (written < g_bytes_get_size (bytes))
-    {
-      g_debug ("Icon validation: %s", error->message);
-      return FALSE;
-    }
-
-  if (!g_output_stream_close (stream, NULL, &error))
-    {
-      g_debug ("Icon validation: %s", error->message);
-      return FALSE;
-    }
-
-  args[0] = icon_validator;
-  args[1] = "--sandbox";
-  args[2] = "512";
-  args[3] = "512";
-  args[4] = name;
-  args[5] = NULL;
-
-  if (!g_spawn_sync (NULL, (char **)args, NULL, 0, NULL, NULL, NULL, &err, &status, &error))
-    {
-      g_debug ("Icon validation: %s", error->message);
-
-      return FALSE;
-    }
-
-  if (!g_spawn_check_exit_status (status, &error))
-    {
-      g_debug ("Icon validation: %s", error->message);
-
-      return FALSE;
-    }
-
-  return TRUE;
-}
-
 static GVariant *
 maybe_remove_icon (GVariant *notification)
 {
@@ -447,7 +359,7 @@ maybe_remove_icon (GVariant *notification)
       g_autoptr(GVariant) value = NULL;
 
       g_variant_get_child (notification, i, "{&sv}", &key, &value);
-      if (strcmp (key, "icon") != 0 || validate_icon_more (value))
+      if (strcmp (key, "icon") != 0 || xdp_validate_serialized_icon (value, FALSE, NULL, NULL))
         g_variant_builder_add (&n, "{sv}", key, value);
     }
 
@@ -475,17 +387,17 @@ handle_add_in_thread_func (GTask *task,
   notification = (GVariant *)g_object_get_data (G_OBJECT (request), "notification");
 
   notification2 = maybe_remove_icon (notification);
-  xdp_impl_notification_call_add_notification (impl,
-                                               xdp_app_info_get_id (request->app_info),
-                                               id,
-                                               notification2,
-                                               NULL,
-                                               add_done,
-                                               g_object_ref (request));
+  xdp_dbus_impl_notification_call_add_notification (impl,
+                                                    xdp_app_info_get_id (request->app_info),
+                                                    id,
+                                                    notification2,
+                                                    NULL,
+                                                    add_done,
+                                                    g_object_ref (request));
 }
 
 static gboolean
-notification_handle_add_notification (XdpNotification *object,
+notification_handle_add_notification (XdpDbusNotification *object,
                                       GDBusMethodInvocation *invocation,
                                       const char *arg_id,
                                       GVariant *notification)
@@ -501,16 +413,16 @@ notification_handle_add_notification (XdpNotification *object,
     {
       g_prefix_error (&error, "invalid notification: ");
       g_dbus_method_invocation_return_gerror (invocation, error);
-      return TRUE;
+      return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   task = g_task_new (object, NULL, NULL, NULL);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_add_in_thread_func);
 
-  xdp_notification_complete_add_notification (object, invocation);
+  xdp_dbus_notification_complete_add_notification (object, invocation);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
@@ -521,8 +433,9 @@ remove_done (GObject *source,
   g_autoptr(Request) request = data;
   g_autoptr(GError) error = NULL;
 
-  if (!xdp_impl_notification_call_remove_notification_finish (impl, result, &error))
+  if (!xdp_dbus_impl_notification_call_remove_notification_finish (impl, result, &error))
     {
+      g_dbus_error_strip_remote_error (error);
       g_warning ("Backend call failed: %s", error->message);
     }
   else
@@ -539,7 +452,7 @@ remove_done (GObject *source,
 }
 
 static gboolean
-notification_handle_remove_notification (XdpNotification *object,
+notification_handle_remove_notification (XdpDbusNotification *object,
                                          GDBusMethodInvocation *invocation,
                                          const char *arg_id)
 {
@@ -547,15 +460,15 @@ notification_handle_remove_notification (XdpNotification *object,
 
   g_object_set_data_full (G_OBJECT (request), "id", g_strdup (arg_id), g_free);
 
-  xdp_impl_notification_call_remove_notification (impl,
-                                                  xdp_app_info_get_id (request->app_info),
-                                                  arg_id,
-                                                  NULL,
-                                                  remove_done, g_object_ref (request));
+  xdp_dbus_impl_notification_call_remove_notification (impl,
+                                                       xdp_app_info_get_id (request->app_info),
+                                                       arg_id,
+                                                       NULL,
+                                                       remove_done, g_object_ref (request));
 
-  xdp_notification_complete_remove_notification (object, invocation);
+  xdp_dbus_notification_complete_remove_notification (object, invocation);
 
-  return TRUE;
+  return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
 static void
@@ -601,7 +514,7 @@ name_owner_changed (GDBusConnection *connection,
 {
   const char *name, *from, *to;
 
-  g_variant_get (parameters, "(sss)", &name, &from, &to);
+  g_variant_get (parameters, "(&s&s&s)", &name, &from, &to);
 
   if (name[0] == ':' &&
       strcmp (name, from) == 0 &&
@@ -624,7 +537,7 @@ name_owner_changed (GDBusConnection *connection,
 }
 
 static void
-notification_iface_init (XdpNotificationIface *iface)
+notification_iface_init (XdpDbusNotificationIface *iface)
 {
   iface->handle_add_notification = notification_handle_add_notification;
   iface->handle_remove_notification = notification_handle_remove_notification;
@@ -633,7 +546,7 @@ notification_iface_init (XdpNotificationIface *iface)
 static void
 notification_init (Notification *notification)
 {
-  xdp_notification_set_version (XDP_NOTIFICATION (notification), 1);
+  xdp_dbus_notification_set_version (XDP_DBUS_NOTIFICATION (notification), 1);
 }
 
 static void
@@ -647,11 +560,11 @@ notification_create (GDBusConnection *connection,
 {
   g_autoptr(GError) error = NULL;
 
-  impl = xdp_impl_notification_proxy_new_sync (connection,
-                                               G_DBUS_PROXY_FLAGS_NONE,
-                                               dbus_name,
-                                               DESKTOP_PORTAL_OBJECT_PATH,
-                                               NULL, &error);
+  impl = xdp_dbus_impl_notification_proxy_new_sync (connection,
+                                                    G_DBUS_PROXY_FLAGS_NONE,
+                                                    dbus_name,
+                                                    DESKTOP_PORTAL_OBJECT_PATH,
+                                                    NULL, &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create notification proxy: %s", error->message);

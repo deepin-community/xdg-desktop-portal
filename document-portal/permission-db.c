@@ -25,7 +25,12 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#ifdef HAVE_SYS_STATFS_H
 #include <sys/statfs.h>
+#endif
+#ifdef HAVE_SYS_MOUNT_H
+#include <sys/mount.h>
+#endif
 
 #include "permission-db.h"
 #include "gvdb/gvdb-reader.h"
@@ -719,7 +724,8 @@ permission_db_set_entry (PermissionDb      *self,
 void
 permission_db_update (PermissionDb *self)
 {
-  GHashTable *root, *main_h, *apps_h;
+  g_autoptr(GHashTable) root = NULL;
+  GHashTable *main_h, *apps_h;
   GBytes *new_contents;
   GvdbTable *new_gvdb;
   int i;
@@ -1002,7 +1008,6 @@ permission_db_entry_get_permissions_variant (PermissionDbEntry *entry,
   GVariant *v = (GVariant *) entry;
 
   g_autoptr(GVariant) app_array = NULL;
-  GVariant *child;
   GVariant *res = NULL;
   gsize n_children, start, end, m;
   const char *child_app_id;
@@ -1016,6 +1021,8 @@ permission_db_entry_get_permissions_variant (PermissionDbEntry *entry,
   end = n_children;
   while (start < end)
     {
+      g_autoptr(GVariant) child = NULL;
+
       m = (start + end) / 2;
 
       child = g_variant_get_child_value (app_array, m);
