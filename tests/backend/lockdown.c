@@ -5,7 +5,7 @@
 
 #include <gio/gio.h>
 
-#include "src/xdp-impl-dbus.h"
+#include "xdp-impl-dbus.h"
 
 #include "lockdown.h"
 
@@ -27,7 +27,7 @@ lockdown_init (GDBusConnection *bus,
   GDBusInterfaceSkeleton *helper;
   g_autoptr(GError) error = NULL;
 
-  helper = G_DBUS_INTERFACE_SKELETON (xdp_impl_lockdown_skeleton_new ());
+  helper = G_DBUS_INTERFACE_SKELETON (xdp_dbus_impl_lockdown_skeleton_new ());
 
   if (!g_dbus_interface_skeleton_export (helper, bus, object_path, &error))
     {

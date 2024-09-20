@@ -5,43 +5,44 @@ Maintainer: Utopia Maintenance Team <pkg-utopia-maintainers@lists.alioth.debian.
 Uploaders:
  Simon McVittie <smcv@debian.org>,
 Build-Depends:
- dbus,
+ dbus-daemon,
  debhelper-compat (= 13),
  geoclue-2.0 <!nocheck>,
- fuse <!nocheck>,
+ fuse3 <!nocheck>,
  libcap2-bin <!nocheck>,
- libgdk-pixbuf-2.0-dev | libgdk-pixbuf2.0-dev,
- libgeoclue-2-dev (>= 2.5.2),
- libflatpak-dev (>= 1.5.0),
- libfuse-dev,
+ libgdk-pixbuf-2.0-dev,
+ libgeoclue-2-dev,
+ libflatpak-dev,
+ libfuse3-dev,
  libglib2.0-dev,
  libjson-glib-dev,
- libpipewire-0.3-dev (>= 0.3.10),
+ libpipewire-0.3-dev,
  libportal-dev (>= 0.3),
- pipewire (>= 0.3.10) <!nocheck>,
+ libsystemd-dev,
+ meson,
+ pipewire <!nocheck>,
  procps <!nocheck>,
  python3 <!nocheck>,
+ python3-dbusmock <!nocheck>,
+ python3-docutils <!nodoc>,
  python3-gi <!nocheck>,
+ python3-pytest <!nocheck>,
  xmlto,
 Rules-Requires-Root: no
-Standards-Version: 4.6.0
+Standards-Version: 4.6.2
 Homepage: https://github.com/flatpak/xdg-desktop-portal
 Vcs-Git: https://salsa.debian.org/debian/xdg-desktop-portal.git
 Vcs-Browser: https://salsa.debian.org/debian/xdg-desktop-portal
 
 Package: xdg-desktop-portal
 Architecture: linux-any
-Multi-arch: foreign
+Multi-Arch: foreign
 Depends:
  bubblewrap,
  default-dbus-session-bus | dbus-session-bus,
- fuse,
+ fuse3,
  ${misc:Depends},
  ${shlibs:Depends},
-Breaks:
- flatpak (<< 0.10.4-1~),
-Replaces:
- flatpak (<< 0.10.4-1~),
 Description: desktop integration portal for Flatpak and Snap
  xdg-desktop-portal provides a portal frontend service for Flatpak, Snap,
  and possibly other desktop containment/sandboxing frameworks. This service
@@ -62,16 +63,10 @@ Description: desktop integration portal for Flatpak and Snap
 
 Package: xdg-desktop-portal-dev
 Architecture: all
-Multi-arch: foreign
+Multi-Arch: foreign
 Depends:
  ${misc:Depends},
  ${shlibs:Depends},
-Breaks:
- libflatpak-dev (<< 0.10.4-1~),
- xdg-desktop-portal (<< 0.5-2~),
-Replaces:
- libflatpak-dev (<< 0.10.4-1~),
- xdg-desktop-portal (<< 0.5-2~),
 Description: desktop integration portal - development files
  xdg-desktop-portal provides a portal frontend service for Flatpak, Snap,
  and possibly other desktop containment/sandboxing frameworks. This service
@@ -86,10 +81,10 @@ Description: desktop integration portal - development files
 Package: xdg-desktop-portal-tests
 Architecture: any
 Depends:
- dbus,
+ dbus-daemon,
  geoclue-2.0,
  libcap2-bin,
- pipewire (>= 0.3.10),
+ pipewire,
  procps,
  python3,
  python3-gi,

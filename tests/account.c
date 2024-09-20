@@ -40,16 +40,19 @@ account_cb (GObject *obj,
       res = g_variant_lookup (ret, "id", "&s", &s); 
       g_assert (res == (t != NULL));
       if (t) g_assert_cmpstr (s, ==, t);
+      free (t);
 
       t = g_key_file_get_string (keyfile, "account", "name", NULL);
       res = g_variant_lookup (ret, "name", "&s", &s); 
       g_assert (res == (t != NULL));
       if (t) g_assert_cmpstr (s, ==, t);
+      free (t);
 
       t = g_key_file_get_string (keyfile, "account", "image", NULL);
       res = g_variant_lookup (ret, "image", "&s", &s); 
       g_assert (res == (t != NULL));
       if (t) g_assert_cmpstr (s, ==, t);
+      free (t);
     }
   else if (response == 1)
     g_assert_error (error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
@@ -147,7 +150,7 @@ test_account_reason (void)
   while (!got_info)
     g_main_context_iteration (NULL, TRUE);
 
-  got_info = FALSE;
+  got_info = 0;
   xdp_portal_get_user_information (portal, NULL, "yy", 0, NULL, account_cb_fail, NULL);
 
   while (!got_info)

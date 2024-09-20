@@ -1,3 +1,5 @@
+![Portals](doc/website/assets/readme.png)
+
 # xdg-desktop-portal
 
 A portal frontend service for [Flatpak](http://www.flatpak.org) and possibly
@@ -11,12 +13,21 @@ The portal interfaces include APIs for file access, opening URIs, printing
 and others.
 
 Documentation for the available D-Bus interfaces can be found	
-[here](https://flatpak.github.io/xdg-desktop-portal/portal-docs.html).
+[here](https://flatpak.github.io/xdg-desktop-portal/docs/).
+
+## Version numbering
+
+xdg-desktop-portal uses even minor vesion numbers for stable versions, and odd
+minor version numbers for unstable versions. During an unstable version cycle,
+portal APIs can make backward incompatible changes, meaning that applications
+should only depend on APIs defined in stable xdg-desktop-portal versions in
+production.
 
 ## Building xdg-desktop-portal
 
 xdg-desktop-portal depends on GLib and Flatpak.
 To build the documentation, you will need xmlto and the docbook stylesheets.
+For more instructions, please read [CONTRIBUTING.md][contributing].
 
 ## Using portals
 
@@ -28,10 +39,17 @@ high-level APIs.
 
 To implement most portals, xdg-desktop-portal relies on a backend
 that provides implementations of the org.freedesktop.impl.portal.\* interfaces.
-Different backends are available see:
-- GTK backend [xdg-desktop-portal-gtk](http://github.com/flatpak/xdg-desktop-portal-gtk)
-- KDE backend [xdg-desktop-portal-kde](https://github.com/KDE/xdg-desktop-portal-kde) (in development)
-- wlroots [xdg-desktop-portal-wlr](https://github.com/emersion/xdg-desktop-portal-wlr) (in development)
+
+Here are some examples of available backends:
+
+- GTK [xdg-desktop-portal-gtk](http://github.com/flatpak/xdg-desktop-portal-gtk)
+- GNOME [xdg-desktop-portal-gnome](https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/)
+- KDE [xdg-desktop-portal-kde](https://invent.kde.org/plasma/xdg-desktop-portal-kde)
+- LXQt [xdg-desktop-portal-lxqt](https://github.com/lxqt/xdg-desktop-portal-lxqt)
+- Pantheon (elementary OS) [xdg-desktop-portal-pantheon](https://github.com/elementary/portals)
+- wlroots [xdg-desktop-portal-wlr](https://github.com/emersion/xdg-desktop-portal-wlr)
+- Deepin [xdg-desktop-portal-dde](https://github.com/linuxdeepin/xdg-desktop-portal-dde)
+- Xapp (Cinnamon, MATE, Xfce) [xdg-desktop-portal-xapp](https://github.com/linuxmint/xdg-desktop-portal-xapp)
 
 ## Design considerations
 
@@ -76,3 +94,6 @@ only be passed into portal APIs in one of two forms:
 When it comes to processes, passing pids around is not useful in a sandboxed
 world where apps are likely in their own pid namespace. And passing pids from
 inside the sandbox is problematic, since the app can just lie.
+
+
+[contributing]: https://github.com/flatpak/xdg-desktop-portal/blob/main/CONTRIBUTING.md

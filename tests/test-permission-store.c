@@ -12,8 +12,10 @@
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 
-#include "src/xdp-utils.h"
+#include "xdp-utils.h"
 #include "document-portal/permission-store-dbus.h"
+#include "src/glib-backports.h"
+#include "utils.h"
 
 char outdir[] = "/tmp/xdp-test-XXXXXX";
 
@@ -505,7 +507,7 @@ test_get_permission2 (void)
 {
   gboolean res;
   const char * in_perms[] = { "yes", NULL };
-  g_autofree char **out_perms = NULL;
+  g_auto(GStrv) out_perms = NULL;
   g_autoptr(GError) error = NULL;
 
   res = xdg_permission_store_call_set_permission_sync (permissions,
@@ -562,10 +564,13 @@ global_setup (void)
   portal_errors = XDG_DESKTOP_PORTAL_ERROR;
 
   g_mkdtemp (outdir);
-  g_print ("outdir: %s\n", outdir);
+  g_debug ("outdir: %s\n", outdir);
 
   g_setenv ("XDG_RUNTIME_DIR", outdir, TRUE);
   g_setenv ("XDG_DATA_HOME", outdir, TRUE);
+
+  /* Re-defining dbus-monitor with a custom script */
+  setup_dbus_daemon_wrapper (outdir);
 
   dbus = g_test_dbus_new (G_TEST_DBUS_NONE);
   services = g_test_build_filename (G_TEST_BUILT, "services", NULL);
@@ -590,7 +595,7 @@ static gboolean
 rm_rf_dir (GFile         *dir,
            GError       **error)
 {
-  GFileEnumerator *enumerator = NULL;
+  g_autoptr(GFileEnumerator) enumerator = NULL;
   g_autoptr(GFileInfo) child_info = NULL;
   GError *temp_error = NULL;
 
@@ -659,6 +664,10 @@ main (int argc, char **argv)
 {
   int res;
 
+  /* Better leak reporting without gvfs */
+  g_setenv ("GIO_USE_VFS", "local", TRUE);
+
+  g_log_writer_default_set_use_stderr (TRUE);
   g_test_init (&argc, &argv, NULL);
 
   g_test_add_func ("/permissions/version", test_version);
@@ -672,9 +681,9 @@ main (int argc, char **argv)
   g_test_add_func ("/permissions/create1", test_create1);
   g_test_add_func ("/permissions/create2", test_create2);
   g_test_add_func ("/permissions/set-value", test_set_value);
-  g_test_add_func ("/permissions/get-pemission1", test_get_permission1);
-  g_test_add_func ("/permissions/get-pemission2", test_get_permission2);
-  g_test_add_func ("/permissions/get-pemission3", test_get_permission3);
+  g_test_add_func ("/permissions/get-permission1", test_get_permission1);
+  g_test_add_func ("/permissions/get-permission2", test_get_permission2);
+  g_test_add_func ("/permissions/get-permission3", test_get_permission3);
 
   global_setup ();
 

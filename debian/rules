@@ -10,15 +10,13 @@ built_binaries := $(shell dh_listpackages)
 CONFFLAGS :=
 
 %:
-	dh $@
+	dh $@ --buildsystem=meson
 
 override_dh_auto_configure:
 	dh_auto_configure -- \
-		--enable-docbook-docs \
-		--enable-geoclue \
-		--enable-installed-tests \
-		--enable-libportal \
-		--enable-pipewire \
+		-Dauto_features=enabled \
+		-Dinstalled-tests=true \
+		-Dsandboxed-image-validation=true \
 		$(CONFFLAGS)
 		$(NULL)
 
