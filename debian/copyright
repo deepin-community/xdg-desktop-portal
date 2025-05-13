@@ -1,21 +1,27 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: xdg-desktop-portal
 Source: https://github.com/flatpak/xdg-desktop-portal/releases
+Files-Excluded: doc/_static/inter.woff2
 
 Files:
  *
 Copyright:
- © 2010 Codethink Limited
- © 2013-2019 Red Hat, Inc
- © 2016 Free Software Foundation, Inc.
- © 2016 Piotr Drag
- © 2016 Aviary.pl
- © 2017 Jan Alexander Steffens
- © 2018-2021 Igalia S.L.
- © 2022 Aleix Pol Gonzalez
- © 2022 Endless OS Foundation, LLC
- © 2022 Georges Basile Stavracas Neto
-License: LGPL-2+
+ 2022 Aleix Pol Gonzalez
+ 2016 Aviary.pl
+ 2010 Codethink Limited
+ 2021 Collabora Ltd.
+ 2020-2022 Endless OS Foundation, LLC
+ 2016 Free Software Foundation, Inc.
+ 2022 Georges Basile Stavracas Neto
+ 2023-2024 GNOME Foundation Inc.
+ 2022 Google LLC
+ 2018-2023 Igalia S.L.
+ 2017 Jan Alexander Steffens
+ 2021-2022 Matthew Leeds
+ 2016 Piotr Drag
+ 2013-2024 Red Hat, Inc
+ 2025 XDG Desktop Portal authors
+License: LGPL-2.1+
 
 Files:
  doc/website/*
@@ -23,10 +29,19 @@ Copyright: none claimed
 License: CC0-1.0
 
 Files:
- src/flatpak-instance.*
+ .github/workflows/check-potfiles.sh
 Copyright:
- © 2018 Red Hat, Inc
-License: LGPL-2.1+
+ 2020-2023 Florian Müllner
+ 2024 Corey Berla
+ 2024 Matthijs Velsink
+License: probably-GPL-2
+ This file originated in gnome-shell, from which it was copied via
+ nautilus and gnome-control-center into xdg-desktop-portal, with no
+ explicit license specified. The actual license is unclear, but it's
+ either GPL-2 or LGPL-2.1, with or without the "or any later version"
+ clause. On a Debian system, the relevant licenses can be found in
+ <file:///usr/share/common-licenses/GPL-2> and
+ <file:///usr/share/common-licenses/LGPL-2.1>.
 
 Files:
  debian/*

@@ -7,6 +7,6 @@ exec 2>&1
 export PATH="$PATH:/sbin:/usr/sbin"
 
 # Some tests are skipped or have longer timeouts in CI
-export TEST_IN_CI=1
+export XDP_TEST_IN_CI=1
 
 exec gnome-desktop-testing-runner xdg-desktop-portal

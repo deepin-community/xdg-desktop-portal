@@ -1,5 +1,5 @@
 Tests: gnome-desktop-testing
-Restrictions: flaky, isolation-machine
+Restrictions: isolation-machine
 Depends:
  gnome-desktop-testing,
  xdg-desktop-portal-tests,
