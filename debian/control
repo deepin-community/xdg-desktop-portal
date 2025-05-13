@@ -30,7 +30,7 @@ Build-Depends:
  procps <!nocheck>,
  python3 <!nocheck> <!noinsttest>,
  python3-dbus <!nocheck> <!noinsttest>,
- python3-dbusmock <!nocheck> <!noinsttest>,
+ python3-dbusmock (>=0.34) <!nocheck> <!noinsttest>,
  python3-docutils <!nodoc>,
  python3-gi <!nocheck> <!noinsttest>,
  python3-pytest <!nocheck> <!noinsttest>,
