@@ -1,3 +1,192 @@
+xdg-desktop-portal (1.20.3+ds-1) unstable; urgency=medium
+
+  * New upstream stable release
+    - Fix a crash when a Flatpak app does not export a .desktop file
+      with the same name as its app-ID (Closes: #1106091)
+    - Allow Flatpak and Snap apps to use portal APIs even if they do not
+      have a .desktop file matching the app-ID
+    - Fix file descriptors being closed too soon, resulting in log noise
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 21 May 2025 11:05:04 +0100
+
+xdg-desktop-portal (1.20.1+ds-2) unstable; urgency=medium
+
+  * Release to unstable (Closes: #1105889)
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 16 May 2025 17:21:45 +0100
+
+xdg-desktop-portal (1.20.1+ds-1) experimental; urgency=medium
+
+  * New upstream stable release
+    - Fix installation of dynamic launcher .desktop files, for example
+      for browsers in webapp mode (Closes: #1105889)
+    - Load portal backends from XDG_DATA_HOME and all XDG_DATA_DIRS,
+      allowing use of locally-installed (unpackaged) backends
+    - Re-order bubblewrap arguments for icon/sound validators to avoid
+      mounting a tmpfs that hides the working directory if run from /tmp,
+      for example during testing
+    - Fix thread-safety in the host app registration portal by doing
+      everything from the main thread
+    - Input capture moves from ACTIVE to ENABLED state when deactivated,
+      instead of staying ACTIVE
+    - Improve log messages for the realtime interface
+    - Stop the D-Bus services before the D-Bus session bus stops,
+      avoiding spurious warnings in the system log
+    - Refactor initialization of app info to reduce duplication and
+      ensure that file descriptors are marked close-on-exec
+    - Log a warning if the documents portal mount point cannot be found
+    - Highlight xdg-desktop-portal errors if outputting to a terminal
+    - Send xdg-desktop-portal log messages to stderr, not stdout
+    - Translation updates: bg, ca
+    - Documentation updates
+  * d/copyright: Use GNU web address instead of FSF's former postal address
+  * d/copyright: Be clearer about the Library vs. Lesser General Public
+    License
+  * d/copyright: Record that some files are GPL-2+
+  * d/xdg-desktop-portal-tests.lintian-overrides:
+    Add an override for a false positive in the tests
+  * Release to experimental for wider testing during the Debian 13 freeze
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 16 May 2025 13:47:10 +0100
+
+xdg-desktop-portal (1.20.0+ds-2) unstable; urgency=medium
+
+  * d/rules: Only enable as-installed tests if we're building that package
+  * d/rules: Enable tests whenever we are building as-installed tests.
+    Even if we will not actually run the tests at build-time, we still
+    need to enable the option if we want to install the as-installed
+    tests, and for that we need a subset of the tests' dependencies.
+    Thanks to Jeremy Bícha (Closes: #1101046)
+  * Standards-Version: 4.7.2 (no changes required)
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 22 Mar 2025 20:47:16 +0000
+
+xdg-desktop-portal (1.20.0+ds-1) unstable; urgency=medium
+
+  * New upstream stable release
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 20 Feb 2025 11:54:43 +0000
+
+xdg-desktop-portal (1.19.4+ds-1) unstable; urgency=medium
+
+  * New upstream development release
+  * d/patches: Drop patches that were applied upstream
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 17 Feb 2025 13:31:49 +0000
+
+xdg-desktop-portal (1.19.3+ds-1) unstable; urgency=medium
+
+  [ Simon McVittie ]
+  * New upstream development release
+  * d/control: libportal-dev is no longer used for unit tests
+  * d/x-d-p.docs: NEWS is now named NEWS.md
+  * d/rules: Rename the pytest option to tests, following upstream
+  * d/control: Explicitly build-depend on python3-dbus.
+    It's used by dbusmock, and the upstream build system checks for it.
+  * d/p/notification-Escape-the-href-attribute-of-links-when-re-s.patch,
+    d/p/tests-Assert-that-href-attributes-are-escaped-correctly.patch,
+    d/p/notification-Escape-the-body-text-of-the-markup-body-when.patch,
+    d/p/tests-Assert-that-markup-body-text-is-escaped-correctly.patch:
+    Add patches from upstream to fix handling of XML in notifications
+  * Release to unstable (Closes: #1095098).
+    While this is still a development release, upstream intends to
+    release 1.20.x in time for the Debian 13 freeze, so it's better to
+    have wider testing at this stage.
+
+  [ Jeremy Bícha ]
+  * Update Homepage
+
+ -- Simon McVittie <smcv@debian.org>  Fri, 14 Feb 2025 18:08:24 +0000
+
+xdg-desktop-portal (1.19.2+ds-1) experimental; urgency=medium
+
+  * New upstream development release
+  * d/rules, d/tests: Set XDP_TEST_IN_CI instead of TEST_IN_CI.
+    The environment variable used to skip flaky tests and extend some
+    other tests' timeouts was renamed in this upstream development branch.
+  * d/control: Add dependencies to run pytest-based tests from autopkgtest
+  * d/copyright: Update
+  * d/p/debian/doc-Use-system-copy-of-Inter-Variable-font.patch:
+    Refresh patch
+
+ -- Simon McVittie <smcv@debian.org>  Tue, 21 Jan 2025 14:45:35 +0000
+
+xdg-desktop-portal (1.19.1+ds-1) experimental; urgency=medium
+
+  * New upstream development release
+  * Drop patches that were included in 1.19.1
+  * d/p/tests-Set-XDG_DATA_DIRS-for-as-installed-testing.patch:
+    Add patch to fix test-portals-openuri.test during autopkgtest
+  * d/copyright: Update
+  * d/watch: Fix dversionmangle processing for +ds versions
+  * d/control: Update build-dependencies
+  * d/control: Depend on GStreamer plugins for WAV, Ogg Vorbis, Ogg Opus
+  * d/rules: Disable pytest-based tests if built with nocheck
+  * d/rules: Disable sandboxing of sound validation during build-time
+    testing, because bubblewrap can't work in a buildd chroot
+  * d/x-d-p.install: Install new x-d-p-validate-sound helper
+  * d/salsa-ci.yml: Use recommended recipe
+  * d/tests/control: Try treating installed-tests as stable.
+    We can mark them as flaky before re-uploading to unstable if this
+    turns out not to be the case.
+  * d/rules: Extend test timeouts on non-x86.
+    Some -ports architectures use qemu for buildds, which can be very
+    slow, and there is no official way to tell which architectures
+    do this.
+
+ -- Simon McVittie <smcv@debian.org>  Thu, 02 Jan 2025 21:33:06 +0000
+
+xdg-desktop-portal (1.19.0+ds-1) experimental; urgency=medium
+
+  * New upstream development release
+  * d/copyright: Update
+  * Repack tarball to exclude vendored Inter Variable font from
+    documentation
+  * d/p/debian/doc-Use-system-copy-of-Inter-Variable-font.patch:
+    Add a patch to avoid using the vendored Inter Variable font, which
+    we remove
+  * d/copyright, d/watch: Update for exclusion of vendored web font
+  * Remove obsolete Lintian override for #1031037, fixed in
+    Lintian 2.117.0
+  * d/control, d/x-d-p-dev.docs, d/x-d-p-dev.doc-base:
+    Build HTML documentation using Sphinx; enable dh_sphinxdoc
+  * d/rules: Update Meson options.
+    sandboxed-image-validation is now a feature rather than a boolean.
+  * d/p/xdp_validate_icon-Assign-argument-indices-automatically.patch,
+    d/p/xdp_validate_icon-Allow-sandboxing-of-the-validator-to-be.patch,
+    d/rules:
+    Disable sandboxing of icon validation during build-time testing.
+    Some buildds build in a chroot, and bubblewrap can't work in that
+    environment.
+  * d/control: Add librsvg2-common to Recommends, Build-Depends,
+    test Depends. This is needed for SVG icon validation.
+  * d/control: Explicitly build-depend on bubblewrap
+  * d/control, d/rules: Only build documentation in arch-indep builds
+  * d/rules: Disable man pages under nodoc build profile
+  * Standards-Version: 4.7.0 (no changes required)
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 30 Oct 2024 19:46:16 +0000
+
+xdg-desktop-portal (1.18.4-2) unstable; urgency=medium
+
+  * d/control, d/gbp.conf: Branch for changes targeting trixie.
+    The debian/latest branch has 1.19.x development releases, which are
+    packaged in experimental but haven't reached a sufficiently frozen
+    status to be considered for inclusion in Debian 13 yet.
+  * d/patches: Backport patches from 1.19.0 to fix test failure with
+    libportal 0.9.0 (Closes: #1091290)
+  * d/patches: Update to upstream 1.18.x branch commit 1.18.4-3-g45b5f7a4
+    - Improve ability to use camera portal from non-sandboxed host apps
+    - Add a missing NEWS entry
+  * d/control: Explicitly build-depend on bubblewrap
+  * d/control, d/rules: Only build documentation in arch-indep builds
+  * d/rules: Disable man pages under nodoc build profile
+  * d/x-d-p.lintian-overrides: Remove obsolete Lintian override for #1031037
+  * d/control: Standards-Version: 4.7.0 (no changes required)
+  * d/salsa-ci.yml: Use recommended recipe
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 01 Jan 2025 18:51:00 +0000
+
 xdg-desktop-portal (1.18.4-1) unstable; urgency=medium
 
   * New upstream stable release
