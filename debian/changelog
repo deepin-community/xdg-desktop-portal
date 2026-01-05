@@ -1,3 +1,9 @@
+xdg-desktop-portal (1.20.3+ds-1deepin1) unstable; urgency=medium
+
+  * fix: disable systemd service by default for flatpak compatibility
+
+ -- zhangkun <zhangkun2@uniontech.com>  Wed, 14 Jan 2025 11:05:04 +0100
+
 xdg-desktop-portal (1.20.3+ds-1) unstable; urgency=medium
 
   * New upstream stable release
