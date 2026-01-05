@@ -70,3 +70,12 @@ override_dh_fixperms:
 ifneq ($(filter %-tests,$(built_binaries)),)
 	chmod --recursive --changes a+rX,u+w,og-w debian/*-tests/usr/libexec/installed-tests
 endif
+
+# Disable xdg-desktop-portal-rewrite-launchers service by default
+# This service cleans up invalid launchers and rewrites sandboxed app launchers
+# Currently not required on deepin
+# 
+# Note: Disabling auto-start may affect Flatpak apps during system boot
+# Enable manually if needed.
+override_dh_installsystemduser:
+	dh_installsystemduser --name=xdg-desktop-portal-rewrite-launchers.service --no-enable
