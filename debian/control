@@ -1,6 +1,5 @@
 Source: xdg-desktop-portal
 Section: admin
-Priority: optional
 Maintainer: Utopia Maintenance Team <pkg-utopia-maintainers@lists.alioth.debian.org>
 Uploaders:
  Simon McVittie <smcv@debian.org>,
@@ -41,8 +40,7 @@ Build-Depends-Indep:
  python3-sphinx <!nodoc>,
  python3-sphinx-copybutton <!nodoc>,
  python3-sphinxext-opengraph <!nodoc>,
-Rules-Requires-Root: no
-Standards-Version: 4.7.2
+Standards-Version: 4.7.3
 Homepage: https://flatpak.github.io/xdg-desktop-portal/
 Vcs-Git: https://salsa.debian.org/debian/xdg-desktop-portal.git
 Vcs-Browser: https://salsa.debian.org/debian/xdg-desktop-portal

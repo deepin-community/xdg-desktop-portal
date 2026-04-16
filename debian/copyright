@@ -19,7 +19,7 @@ Copyright:
  2017 Jan Alexander Steffens
  2021-2022 Matthew Leeds
  2016 Piotr Drag
- 2013-2024 Red Hat, Inc
+ 2013-2026 Red Hat, Inc
  2025 XDG Desktop Portal authors
 License: LGPL-2.1+
 
@@ -59,6 +59,52 @@ Copyright:
  © 2016-2018 Simon McVittie
  © 2016-2018 Collabora Ltd.
 License: LGPL-2+
+
+Files:
+ subprojects/libglnx/*
+Copyright:
+ 2022 Alexander Richardson
+ 2023 CaiJingLong
+ 2015 Canonical Limited
+ 2021 Casper Dik
+ 2012-2016 Colin Walters
+ 2019-2024 Collabora Ltd.
+ 2014 Dan Winship
+ 2017 Emmanuele Bassi
+ 2017-2022 Endless OS Foundation LLC
+ 1995-1997 Josh MacDonald
+ 2007-2011 Lennart Poettering
+ 1998 Manish Singh
+ 2020 Matt Rose
+ 2006-2007 Matthias Clasen
+ 2020 Niels De Graef
+ 2006 Padraig O'Briain
+ 1995-1997 Peter Mattis
+ 2018 Peter Wu
+ 2022 Ray Strode
+ 2000-2026 Red Hat, Inc.
+ 2019 Sebastian Schwarz
+ 2023 Sebastian Wilhelmi
+ 2022 Simon McVittie
+ 1995-1997 Spencer Kimball
+ 2022 Thomas Haller
+ 1998 Tim Janik
+ 2019 Ting-Wei Lan
+ 2016 Zbigniew Jędrzejewski-Szmek
+ 2019 Руслан Ижбулатов
+License: LGPL-2+ and LGPL-2.1+
+
+Files:
+ subprojects/libglnx/tests/test-libglnx-backports.c
+Copyright:
+ 2021-2024 Collabora Ltd.
+ 2019 Emmanuel Fleury
+ 2018 Endless OS Foundation, LLC
+ 1995-1997 Josh MacDonald
+ 1995-1997 Peter Mattis
+ 2011 Red Hat, Inc.
+ 1995-1997 Spencer Kimball
+License: LGPL-2.1+ and old-glib-tests
 
 License: CC0-1.0
  On Debian systems, the full text of the Creative Commons Zero 1.0 Universal
@@ -119,3 +165,21 @@ License: LGPL-2.1+
 Comment:
  On Debian systems, the full text of the GNU Lesser General Public License
  version 2.1 can be found in the file '/usr/share/common-licenses/LGPL-2.1'.
+
+License: old-glib-tests
+ This work is provided "as is"; redistribution and modification
+ in whole or in part, in any medium, physical or electronic is
+ permitted without restriction.
+ .
+ This work is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ .
+ In no event shall the authors or contributors be liable for any
+ direct, indirect, incidental, special, exemplary, or consequential
+ damages (including, but not limited to, procurement of substitute
+ goods or services; loss of use, data, or profits; or business
+ interruption) however caused and on any theory of liability, whether
+ in contract, strict liability, or tort (including negligence or
+ otherwise) arising in any way out of the use of this software, even
+ if advised of the possibility of such damage.

@@ -1,8 +1,34 @@
-xdg-desktop-portal (1.20.3+ds-1deepin1) unstable; urgency=medium
+xdg-desktop-portal (1.20.4+ds-1) unstable; urgency=medium
 
-  * fix: disable systemd service by default for flatpak compatibility
+  * New upstream release
+    - This version fixes a vulnerability in which a malicious or compromised
+      Flatpak app could send any file or directory to the trash, including
+      those outside its sandbox.
+      (GHSA-rqr9-jwwf-wxgj) (Closes: #1132958)
 
- -- zhangkun <zhangkun2@uniontech.com>  Wed, 14 Jan 2025 11:05:04 +0100
+ -- Simon McVittie <smcv@debian.org>  Wed, 08 Apr 2026 11:30:32 +0100
+
+xdg-desktop-portal (1.20.3+ds-3) unstable; urgency=medium
+
+  * d/p/validate-icon-sound-Print-debug-logs-to-stderr-only.patch:
+    Add patch from upstream to fix a test regression with updated
+    gdk-pixbuf (Closes: #1129171)
+  * Remove Lintian override for #1115463, no longer needed
+
+ -- Simon McVittie <smcv@debian.org>  Wed, 11 Mar 2026 12:28:40 +0000
+
+xdg-desktop-portal (1.20.3+ds-2) unstable; urgency=medium
+
+  * d/watch: Convert to v5 format
+    - Add Lintian override for #1125489
+  * d/gbp.conf, d/watch: Only watch for stable (even-numbered) releases
+  * d/watch.devel: Add alternative uscan watch file for development
+    (odd-numbered) releases
+  * d/control: Remove Rules-Requires-Root, unnecessary since Debian 13
+  * d/control: Standards-Version: 4.7.3
+    - Remove Priority: optional, not required since Debian 13
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 24 Jan 2026 14:47:56 +0000
 
 xdg-desktop-portal (1.20.3+ds-1) unstable; urgency=medium
 
