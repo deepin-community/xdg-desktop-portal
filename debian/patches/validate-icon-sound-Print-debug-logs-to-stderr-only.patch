@@ -1,0 +1,43 @@
+From: Alessandro Astone <alessandro.astone@canonical.com>
+Date: Mon, 9 Feb 2026 20:54:58 +0100
+Subject: validate-{icon,sound}: Print debug logs to stderr only
+
+stdout is used for communicating results to the parent process, so it cannot
+be used to also print debug logs. If G_MESSAGES_DEBUG=all were to be inherited
+from the parent environment, we could be writing random strings to stdout and
+breaking the parsing on the parent side.
+
+Forwarded: https://github.com/flatpak/xdg-desktop-portal/pull/1901
+Applied-upstream: 1.21.0, commit:68755dffa8e5123aad0a47089ded3aa19e1a891e
+Bug-Debian: https://bugs.debian.org/1129171
+---
+ src/validate-icon.c  | 2 ++
+ src/validate-sound.c | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/src/validate-icon.c b/src/validate-icon.c
+index 4440543..3ac7a1a 100644
+--- a/src/validate-icon.c
++++ b/src/validate-icon.c
+@@ -342,6 +342,8 @@ main (int argc, char *argv[])
+   g_autoptr(GError) error = NULL;
+   g_autofd int fd_path = -1;
+ 
++  g_log_writer_default_set_use_stderr (TRUE);
++
+   context = g_option_context_new (NULL);
+   g_option_context_add_main_entries (context, entries, NULL);
+   if (!g_option_context_parse (context, &argc, &argv, &error))
+diff --git a/src/validate-sound.c b/src/validate-sound.c
+index db2b2e3..e922e28 100644
+--- a/src/validate-sound.c
++++ b/src/validate-sound.c
+@@ -328,6 +328,8 @@ main (int argc, char *argv[])
+   g_autoptr(GOptionContext) context = NULL;
+   g_autoptr(GError) error = NULL;
+ 
++  g_log_writer_default_set_use_stderr (TRUE);
++
+   context = g_option_context_new (NULL);
+   g_option_context_add_main_entries (context, entries, NULL);
+   if (!g_option_context_parse (context, &argc, &argv, &error))
