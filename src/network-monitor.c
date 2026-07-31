@@ -22,12 +22,14 @@
 
 #include "config.h"
 
+#include "network-monitor.h"
+
 #include <string.h>
+
 #include <gio/gio.h>
 
-#include "network-monitor.h"
-#include "xdp-call.h"
 #include "xdp-app-info.h"
+#include "xdp-context.h"
 #include "xdp-dbus.h"
 #include "xdp-utils.h"
 
@@ -46,8 +48,6 @@ struct _NetworkMonitorClass
   XdpDbusNetworkMonitorSkeletonClass parent_class;
 };
 
-static NetworkMonitor *network_monitor;
-
 GType network_monitor_get_type (void) G_GNUC_CONST;
 static void network_monitor_iface_init (XdpDbusNetworkMonitorIface *iface);
 
@@ -56,13 +56,15 @@ G_DEFINE_TYPE_WITH_CODE (NetworkMonitor, network_monitor,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_NETWORK_MONITOR,
                                                 network_monitor_iface_init));
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (NetworkMonitor, g_object_unref)
+
 static gboolean
 handle_get_available (XdpDbusNetworkMonitor *object,
                       GDBusMethodInvocation *invocation)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
 
-  if (!xdp_app_info_has_network (call->app_info))
+  if (!xdp_app_info_has_network (app_info))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
@@ -84,9 +86,9 @@ static gboolean
 handle_get_metered (XdpDbusNetworkMonitor *object,
                     GDBusMethodInvocation *invocation)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
 
-  if (!xdp_app_info_has_network (call->app_info))
+  if (!xdp_app_info_has_network (app_info))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
@@ -108,9 +110,9 @@ static gboolean
 handle_get_connectivity (XdpDbusNetworkMonitor *object,
                          GDBusMethodInvocation *invocation)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
 
-  if (!xdp_app_info_has_network (call->app_info))
+  if (!xdp_app_info_has_network (app_info))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
@@ -132,9 +134,9 @@ static gboolean
 handle_get_status (XdpDbusNetworkMonitor *object,
                    GDBusMethodInvocation *invocation)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
 
-  if (!xdp_app_info_has_network (call->app_info))
+  if (!xdp_app_info_has_network (app_info))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
@@ -184,9 +186,9 @@ handle_can_reach (XdpDbusNetworkMonitor *object,
                   const char            *hostname,
                   guint                  port)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
 
-  if (!xdp_app_info_has_network (call->app_info))
+  if (!xdp_app_info_has_network (app_info))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR,
@@ -216,32 +218,65 @@ network_monitor_iface_init (XdpDbusNetworkMonitorIface *iface)
 }
 
 static void
-network_changed (GObject *object,
-                 gboolean network_available,
-                 NetworkMonitor *nm)
+on_network_changed (GObject  *object,
+                    gboolean  network_available,
+                    gpointer  user_data)
 {
+  NetworkMonitor *nm = user_data;
+
   xdp_dbus_network_monitor_emit_changed (XDP_DBUS_NETWORK_MONITOR (nm));
+}
+
+static void
+network_monitor_dispose (GObject *object)
+{
+  NetworkMonitor *network_monitor = (NetworkMonitor *) object;
+
+  g_clear_object (&network_monitor->monitor);
+
+  G_OBJECT_CLASS (network_monitor_parent_class)->dispose (object);
 }
 
 static void
 network_monitor_init (NetworkMonitor *nm)
 {
-  nm->monitor = g_network_monitor_get_default ();
-
-  g_signal_connect (nm->monitor, "network-changed", G_CALLBACK (network_changed), nm);
-
-  xdp_dbus_network_monitor_set_version (XDP_DBUS_NETWORK_MONITOR (nm), 3);
 }
 
 static void
 network_monitor_class_init (NetworkMonitorClass *klass)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->dispose = network_monitor_dispose;
 }
 
-GDBusInterfaceSkeleton *
-network_monitor_create (GDBusConnection *connection)
+static NetworkMonitor *
+network_monitor_new (void)
 {
+  NetworkMonitor *network_monitor;
+
   network_monitor = g_object_new (network_monitor_get_type (), NULL);
 
-  return G_DBUS_INTERFACE_SKELETON (network_monitor);
+  network_monitor->monitor = g_network_monitor_get_default ();
+
+  g_signal_connect_object (network_monitor->monitor, "network-changed",
+                           G_CALLBACK (on_network_changed),
+                           network_monitor,
+                           G_CONNECT_DEFAULT);
+
+  xdp_dbus_network_monitor_set_version (XDP_DBUS_NETWORK_MONITOR (network_monitor), 3);
+
+  return network_monitor;
+}
+
+void
+init_network_monitor (XdpContext *context)
+{
+  g_autoptr(NetworkMonitor) network_monitor = NULL;
+
+  network_monitor = network_monitor_new ();
+
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&network_monitor)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }

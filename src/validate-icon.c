@@ -25,11 +25,12 @@
  * - https://github.com/flatpak/xdg-desktop-portal at src/validate-icon.c
  */
 
-#include <gdk-pixbuf/gdk-pixbuf.h>
-#include <glib/gstdio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
+
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <glib/gstdio.h>
 
 #include "xdp-utils.h"
 
@@ -341,6 +342,8 @@ main (int argc, char *argv[])
   g_autoptr(GOptionContext) context = NULL;
   g_autoptr(GError) error = NULL;
   g_autofd int fd_path = -1;
+
+  g_log_writer_default_set_use_stderr (TRUE);
 
   context = g_option_context_new (NULL);
   g_option_context_add_main_entries (context, entries, NULL);

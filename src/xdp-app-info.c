@@ -23,75 +23,79 @@
 
 #include "config.h"
 
+#include "xdp-app-info-private.h"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#ifdef HAVE_SYS_VFS_H
+
+#include <gio/gunixfdlist.h>
+#include <json-glib/json-glib.h>
+
+#include "xdp-app-info-flatpak-private.h"
+#include "xdp-app-info-host-private.h"
+#include "xdp-app-info-linyaps-private.h"
+#include "xdp-app-info-snap-private.h"
+#include "xdp-enum-types.h"
+#include "xdp-utils.h"
+
+#if HAVE_SYS_VFS_H
 #include <sys/vfs.h>
 #endif
-#ifdef HAVE_SYS_MOUNT_H
+#if HAVE_SYS_MOUNT_H
 #include <sys/mount.h>
 #endif
-#ifdef HAVE_LIBSYSTEMD
+#if HAVE_LIBSYSTEMD
 #include <systemd/sd-login.h>
 #include "sd-escape.h"
 #endif
 
-#include <json-glib/json-glib.h>
-#include <gio/gunixfdlist.h>
-
-#include "xdp-app-info-private.h"
-#include "xdp-app-info-flatpak-private.h"
-#include "xdp-app-info-snap-private.h"
-#include "xdp-app-info-host-private.h"
-#include "xdp-app-info-test-private.h"
-#include "xdp-enum-types.h"
-#include "xdp-utils.h"
-
-#define DBUS_NAME_DBUS "org.freedesktop.DBus"
-#define DBUS_INTERFACE_DBUS DBUS_NAME_DBUS
-#define DBUS_PATH_DBUS "/org/freedesktop/DBus"
-
-G_LOCK_DEFINE (app_infos);
-static GHashTable *app_info_by_unique_name;
-
-G_DEFINE_QUARK (XdpAppInfo, xdp_app_info_error);
+G_DEFINE_QUARK (xdp-app-info-error, xdp_app_info_error);
 
 typedef struct _XdpAppInfoPrivate
 {
+  /* identity */
   char *engine;
   char *id;
   char *instance;
-  int pidfd;
+
+  /* app info */
   GAppInfo *gappinfo;
-  XdpAppInfoFlags flags;
+
+  /* calling process */
+  int pidfd;
+
+  /* dbus name of the sender */
+  char *sender;
 
   /* pid namespace mapping */
   GMutex pidns_lock;
   ino_t pidns_id;
+
+  /* misc */
+  XdpAppInfoFlags flags;
 } XdpAppInfoPrivate;
 
 static void g_initable_init_iface (GInitableIface *iface);
 
 G_DEFINE_ABSTRACT_TYPE_WITH_CODE (XdpAppInfo, xdp_app_info, G_TYPE_OBJECT,
                                   G_ADD_PRIVATE (XdpAppInfo)
-                                  G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE, g_initable_init_iface))
+                                  G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE, g_initable_init_iface));
 
-enum
+typedef enum
 {
-  PROP_0,
-  PROP_ENGINE,
+  PROP_ENGINE = 1,
   PROP_FLAGS,
   PROP_G_APP_INFO,
   PROP_ID,
   PROP_INSTANCE,
   PROP_PIDFD,
-  N_PROPS
-};
+  PROP_SENDER,
+} XdpAppInfoProps;
 
-static GParamSpec *properties [N_PROPS];
+static GParamSpec *properties [PROP_SENDER + 1];
 
 static gboolean
 xdp_app_info_initable_init (GInitable     *initable,
@@ -144,6 +148,7 @@ xdp_app_info_dispose (GObject *object)
   g_clear_pointer (&priv->id, g_free);
   g_clear_pointer (&priv->instance, g_free);
   g_clear_object (&priv->gappinfo);
+  g_clear_pointer (&priv->sender, g_free);
 
   if (!g_clear_fd (&priv->pidfd, &error))
     g_warning ("Error closing pidfd: %s", error->message);
@@ -160,7 +165,7 @@ xdp_app_info_get_property (GObject    *object,
   XdpAppInfoPrivate *priv =
     xdp_app_info_get_instance_private (XDP_APP_INFO (object));
 
-  switch (prop_id)
+  switch ((XdpAppInfoProps) prop_id)
     {
     case PROP_ENGINE:
       g_value_set_string (value, priv->engine);
@@ -186,8 +191,9 @@ xdp_app_info_get_property (GObject    *object,
       g_value_set_int (value, priv->pidfd);
       break;
 
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+    case PROP_SENDER:
+      g_value_set_string (value, priv->sender);
+      break;
     }
 }
 
@@ -200,7 +206,7 @@ xdp_app_info_set_property (GObject      *object,
   XdpAppInfoPrivate *priv =
     xdp_app_info_get_instance_private (XDP_APP_INFO (object));
 
-  switch (prop_id)
+  switch ((XdpAppInfoProps) prop_id)
     {
     case PROP_ENGINE:
       g_assert (priv->engine == NULL);
@@ -224,11 +230,17 @@ xdp_app_info_set_property (GObject      *object,
 
     case PROP_PIDFD:
       g_assert (priv->pidfd == -1);
+      /* Steals ownership from the GValue */
       priv->pidfd = g_value_get_int (value);
       break;
 
-    default:
-      G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+    case PROP_SENDER:
+      g_assert (priv->sender == NULL);
+      priv->sender = g_value_dup_string (value);
+      break;
+    case PROP_G_APP_INFO:
+      g_assert_not_reached ();
+      break;
     }
 }
 
@@ -277,6 +289,8 @@ xdp_app_info_class_init (XdpAppInfoClass *klass)
                          G_PARAM_CONSTRUCT_ONLY |
                          G_PARAM_STATIC_STRINGS);
 
+  /* Note that setting this property at construct-time takes ownership
+   * of the fd from the caller */
   properties[PROP_PIDFD] =
     g_param_spec_int ("pidfd", NULL, NULL,
                       -1, G_MAXINT, -1,
@@ -284,7 +298,14 @@ xdp_app_info_class_init (XdpAppInfoClass *klass)
                       G_PARAM_CONSTRUCT_ONLY |
                       G_PARAM_STATIC_STRINGS);
 
-  g_object_class_install_properties (object_class, N_PROPS, properties);
+  properties[PROP_SENDER] =
+    g_param_spec_string ("sender", NULL, NULL,
+                         NULL,
+                         G_PARAM_READWRITE |
+                         G_PARAM_CONSTRUCT_ONLY |
+                         G_PARAM_STATIC_STRINGS);
+
+  g_object_class_install_properties (object_class, G_N_ELEMENTS (properties), properties);
 }
 
 static void
@@ -293,6 +314,125 @@ xdp_app_info_init (XdpAppInfo *app_info)
   XdpAppInfoPrivate *priv = xdp_app_info_get_instance_private (app_info);
 
   priv->pidfd = -1;
+}
+
+static XdpAppInfo *
+xdp_app_info_new (const char  *sender,
+                  uint32_t     pid,
+                  int          pidfd,
+                  GError     **error)
+{
+  g_autoptr(XdpAppInfo) app_info = NULL;
+  g_autofd int pidfd_owned = pidfd;
+  g_autoptr(GError) local_error = NULL;
+
+  app_info = xdp_app_info_flatpak_new (sender, pid, &pidfd_owned, &local_error);
+
+  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
+                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return NULL;
+    }
+  g_clear_error (&local_error);
+
+  if (app_info == NULL)
+    app_info = xdp_app_info_snap_new (sender, pid, &pidfd_owned, &local_error);
+
+  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
+                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return NULL;
+    }
+  g_clear_error (&local_error);
+
+  if (app_info == NULL)
+    app_info = xdp_app_info_linyaps_new (sender, pid, &pidfd_owned, &local_error);
+
+  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
+                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
+    {
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return NULL;
+    }
+  g_clear_error (&local_error);
+
+  if (app_info == NULL)
+    app_info = xdp_app_info_host_new (sender, pid, &pidfd_owned);
+
+  g_assert (XDP_IS_APP_INFO (app_info));
+
+  return g_steal_pointer (&app_info);
+}
+
+XdpAppInfo *
+xdp_app_info_new_for_invocation_sync (GDBusMethodInvocation  *invocation,
+                                      GCancellable           *cancellable,
+                                      GError                **error)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const char *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autofd int pidfd = -1;
+  uint32_t pid;
+  g_autoptr(GError) local_error = NULL;
+
+  if (!xdp_connection_get_pidfd_sync (connection, sender,
+                                      cancellable,
+                                      &pidfd, &pid,
+                                      error))
+    return NULL;
+
+  return xdp_app_info_new (sender, pid, g_steal_fd (&pidfd), error);
+}
+
+XdpAppInfo *
+xdp_app_info_new_for_registered_sync (GDBusMethodInvocation  *invocation,
+                                      const char             *app_id,
+                                      GCancellable           *cancellable,
+                                      GError                **error)
+{
+  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
+  const char *sender = g_dbus_method_invocation_get_sender (invocation);
+  g_autofd int pidfd = -1;
+  uint32_t pid;
+  g_autoptr(GError) local_error = NULL;
+
+  if (!xdp_connection_get_pidfd_sync (connection, sender,
+                                      cancellable,
+                                      &pidfd, &pid,
+                                      error))
+    return NULL;
+
+  return xdp_app_info_host_new_registered (sender,
+                                           pid, g_steal_fd (&pidfd),
+                                           app_id,
+                                           error);
+}
+
+const char *
+xdp_app_info_get_app_display_name (XdpAppInfo *app_info)
+{
+  XdpAppInfoPrivate *priv = xdp_app_info_get_instance_private (app_info);
+
+  if (priv->gappinfo)
+    return g_app_info_get_display_name (priv->gappinfo);
+
+  if (g_strcmp0 (priv->id, "") != 0)
+    return priv->id;
+
+  return NULL;
+}
+
+const char *
+xdp_app_info_get_engine_display_name (XdpAppInfo *app_info)
+{
+  XdpAppInfoPrivate *priv = xdp_app_info_get_instance_private (app_info);
+
+  if (priv->engine && g_strcmp0 (priv->engine, "") != 0)
+    return priv->engine;
+
+  return g_type_name (G_OBJECT_TYPE (app_info));
 }
 
 gboolean
@@ -329,6 +469,30 @@ xdp_app_info_get_instance (XdpAppInfo *app_info)
   priv = xdp_app_info_get_instance_private (app_info);
 
   return priv->instance;
+}
+
+const char *
+xdp_app_info_get_engine (XdpAppInfo *app_info)
+{
+  XdpAppInfoPrivate *priv;
+
+  g_return_val_if_fail (app_info != NULL, NULL);
+
+  priv = xdp_app_info_get_instance_private (app_info);
+
+  return priv->engine;
+}
+
+const char *
+xdp_app_info_get_sender (XdpAppInfo *app_info)
+{
+  XdpAppInfoPrivate *priv;
+
+  g_return_val_if_fail (app_info != NULL, NULL);
+
+  priv = xdp_app_info_get_instance_private (app_info);
+
+  return priv->sender;
 }
 
 GAppInfo *
@@ -390,7 +554,7 @@ xdp_app_info_get_pidns (XdpAppInfo  *app_info,
       return FALSE;
     }
 
-  if (!xdp_pidfd_get_namespace (priv->pidfd, &ns, error))
+  if (!xdp_pidfd_get_pidns (priv->pidfd, &ns, error))
     return FALSE;
 
   priv->pidns_id = ns;
@@ -612,7 +776,8 @@ xdp_app_info_get_path_for_fd (XdpAppInfo   *app_info,
         {
           g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
                        "App \"%s\" of type %s does not support O_PATH fd passing",
-                       priv->id, priv->engine);
+                       priv->id,
+                       xdp_app_info_get_engine_display_name (app_info));
           return NULL;
         }
 
@@ -734,378 +899,4 @@ xdp_app_info_get_usb_queries (XdpAppInfo *app_info)
     }
 
   return XDP_APP_INFO_GET_CLASS (app_info)->get_usb_queries (app_info);
-}
-
-static gboolean
-xdp_connection_get_pid_legacy (GDBusConnection  *connection,
-                               const char       *sender,
-                               GCancellable     *cancellable,
-                               int              *out_pidfd,
-                               uint32_t         *out_pid,
-                               GError          **error)
-{
-  g_autoptr(GVariant) reply = NULL;
-
-  reply = g_dbus_connection_call_sync (connection,
-                                       DBUS_NAME_DBUS,
-                                       DBUS_PATH_DBUS,
-                                       DBUS_INTERFACE_DBUS,
-                                       "GetConnectionUnixProcessID",
-                                       g_variant_new ("(s)", sender),
-                                       G_VARIANT_TYPE ("(u)"),
-                                       G_DBUS_CALL_FLAGS_NONE,
-                                       30000,
-                                       cancellable,
-                                       error);
-  if (!reply)
-    return FALSE;
-
-  *out_pidfd = -1;
-  g_variant_get (reply, "(u)", out_pid);
-  return TRUE;
-}
-
-static gboolean
-xdp_connection_get_pidfd (GDBusConnection  *connection,
-                          const char       *sender,
-                          GCancellable     *cancellable,
-                          int              *out_pidfd,
-                          uint32_t         *out_pid,
-                          GError          **error)
-{
-  g_autoptr(GVariant) reply = NULL;
-  g_autoptr(GVariant) dict = NULL;
-  g_autoptr(GError) local_error = NULL;
-  g_autoptr(GVariant) process_fd = NULL;
-  g_autoptr(GVariant) process_id = NULL;
-  uint32_t pid;
-  int fd_index;
-  g_autoptr(GUnixFDList) fd_list = NULL;
-  g_autofd int pidfd = -1;
-
-  reply = g_dbus_connection_call_with_unix_fd_list_sync (connection,
-                                                         DBUS_NAME_DBUS,
-                                                         DBUS_PATH_DBUS,
-                                                         DBUS_INTERFACE_DBUS,
-                                                         "GetConnectionCredentials",
-                                                         g_variant_new ("(s)", sender),
-                                                         G_VARIANT_TYPE ("(a{sv})"),
-                                                         G_DBUS_CALL_FLAGS_NONE,
-                                                         30000,
-                                                         NULL,
-                                                         &fd_list,
-                                                         cancellable,
-                                                         &local_error);
-
-  if (!reply)
-    {
-      if (g_error_matches (local_error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_INTERFACE))
-        {
-          return xdp_connection_get_pid_legacy (connection,
-                                                sender,
-                                                cancellable,
-                                                out_pidfd,
-                                                out_pid,
-                                                error);
-        }
-
-      g_propagate_error (error, g_steal_pointer (&local_error));
-      return FALSE;
-    }
-
-  g_variant_get (reply, "(@a{sv})", &dict);
-
-  process_id = g_variant_lookup_value (dict, "ProcessID", G_VARIANT_TYPE_UINT32);
-  if (!process_id)
-    {
-      return xdp_connection_get_pid_legacy (connection,
-                                            sender,
-                                            cancellable,
-                                            out_pidfd,
-                                            out_pid,
-                                            error);
-    }
-
-  pid = g_variant_get_uint32 (process_id);
-
-  process_fd = g_variant_lookup_value (dict, "ProcessFD", G_VARIANT_TYPE_HANDLE);
-  if (!process_fd)
-    {
-      *out_pidfd = -1;
-      *out_pid = pid;
-      return TRUE;
-    }
-
-  fd_index = g_variant_get_handle (process_fd);
-
-  if (fd_list == NULL)
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Can't find peer pidfd");
-      return FALSE;
-    }
-
-  if (fd_index >= g_unix_fd_list_get_length (fd_list))
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Pidfd index is out of bounds");
-      return FALSE;
-    }
-
-  pidfd = g_unix_fd_list_get (fd_list, fd_index, error);
-  if (pidfd < 0)
-    return FALSE;
-
-  *out_pidfd = g_steal_fd (&pidfd);
-  *out_pid = pid;
-  return TRUE;
-}
-
-static XdpAppInfo *
-cache_lookup_app_info_by_sender (const char *sender)
-{
-  XdpAppInfo *app_info = NULL;
-
-  G_LOCK (app_infos);
-  if (app_info_by_unique_name)
-    {
-      app_info = g_hash_table_lookup (app_info_by_unique_name, sender);
-      if (app_info)
-        g_object_ref (app_info);
-    }
-  G_UNLOCK (app_infos);
-
-  return app_info;
-}
-
-static gboolean
-cache_has_app_info_by_sender (const char *sender)
-{
-  gboolean has_app_info = FALSE;
-
-  G_LOCK (app_infos);
-  if (app_info_by_unique_name)
-    has_app_info = !!g_hash_table_lookup (app_info_by_unique_name, sender);
-  G_UNLOCK (app_infos);
-
-  return has_app_info;
-}
-
-static void
-ensure_app_info_by_unique_name (void)
-{
-  if (app_info_by_unique_name == NULL)
-    app_info_by_unique_name = g_hash_table_new_full (g_str_hash, g_str_equal,
-                                                     g_free,
-                                                     g_object_unref);
-}
-
-static void
-cache_insert_app_info (const char *sender,
-                       XdpAppInfo *app_info)
-{
-  G_LOCK (app_infos);
-  ensure_app_info_by_unique_name ();
-  g_hash_table_insert (app_info_by_unique_name, g_strdup (sender),
-                       g_object_ref (app_info));
-  G_UNLOCK (app_infos);
-}
-
-static void
-on_peer_died (const char *name)
-{
-  G_LOCK (app_infos);
-  if (app_info_by_unique_name)
-    g_hash_table_remove (app_info_by_unique_name, name);
-  G_UNLOCK (app_infos);
-}
-
-static XdpAppInfo *
-maybe_create_test_app_info (void)
-{
-  const char *test_override_app_id;
-  const char *test_override_usb_queries;
-
-  test_override_app_id = g_getenv ("XDG_DESKTOP_PORTAL_TEST_APP_ID");
-  if (!test_override_app_id)
-    return NULL;
-
-  test_override_usb_queries = g_getenv ("XDG_DESKTOP_PORTAL_TEST_USB_QUERIES");
-  return xdp_app_info_test_new (test_override_app_id,
-                                test_override_usb_queries);
-}
-
-static XdpAppInfo *
-maybe_create_registered_test_app_info (const char *registered_app_id)
-{
-  const char *test_override_app_id;
-  const char *test_override_usb_queries;
-
-  test_override_app_id = g_getenv ("XDG_DESKTOP_PORTAL_TEST_APP_ID");
-  if (!test_override_app_id)
-    return NULL;
-
-  test_override_usb_queries = g_getenv ("XDG_DESKTOP_PORTAL_TEST_USB_QUERIES");
-  return xdp_app_info_test_new (registered_app_id,
-                                test_override_usb_queries);
-}
-
-static XdpAppInfo *
-xdp_connection_create_app_info_sync (GDBusConnection  *connection,
-                                     const char       *sender,
-                                     GCancellable     *cancellable,
-                                     GError          **error)
-{
-  g_autoptr(XdpAppInfo) app_info = NULL;
-  g_autofd int pidfd = -1;
-  uint32_t pid;
-  g_autoptr(GError) local_error = NULL;
-  const char *app_info_kind = NULL;
-
-  if (!xdp_connection_get_pidfd (connection, sender, cancellable, &pidfd, &pid, error))
-    return NULL;
-
-  app_info = maybe_create_test_app_info ();
-  if (app_info)
-    app_info_kind = "test";
-
-  if (app_info == NULL)
-    {
-      app_info = xdp_app_info_flatpak_new (pid, &pidfd, &local_error);
-      if (app_info)
-        app_info_kind = "flatpak";
-    }
-
-  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
-                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
-    {
-      g_propagate_error (error, g_steal_pointer (&local_error));
-      return NULL;
-    }
-  g_clear_error (&local_error);
-
-  if (app_info == NULL)
-    {
-      app_info = xdp_app_info_snap_new (pid, &pidfd, &local_error);
-      if (app_info)
-        app_info_kind = "snap";
-    }
-
-  if (!app_info && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
-                                     XDP_APP_INFO_ERROR_WRONG_APP_KIND))
-    {
-      g_propagate_error (error, g_steal_pointer (&local_error));
-      return NULL;
-    }
-  g_clear_error (&local_error);
-
-  if (app_info == NULL)
-    {
-      app_info = xdp_app_info_host_new (pid, &pidfd);
-      app_info_kind = "derived host";
-    }
-
-  g_assert (XDP_IS_APP_INFO (app_info));
-
-  g_debug ("Adding %s app '%s'", app_info_kind, xdp_app_info_get_id (app_info));
-
-  cache_insert_app_info (sender, app_info);
-
-  xdp_connection_track_name_owners (connection, on_peer_died);
-
-  return g_steal_pointer (&app_info);
-}
-
-static XdpAppInfo *
-xdp_connection_create_host_app_info_sync (GDBusConnection  *connection,
-                                          const char       *sender,
-                                          const char       *app_id,
-                                          GCancellable     *cancellable,
-                                          GError          **error)
-{
-  g_autoptr(XdpAppInfo) app_info = NULL;
-  g_autofd int pidfd = -1;
-  uint32_t pid;
-
-  if (!xdp_connection_get_pidfd (connection, sender, cancellable, &pidfd, &pid, error))
-    return NULL;
-
-  app_info = maybe_create_registered_test_app_info (app_id);
-
-  if (!app_info)
-    {
-      gboolean is_sandboxed = FALSE;
-
-      if (!xdp_is_flatpak (pid, &is_sandboxed, error))
-        return NULL;
-
-      if (is_sandboxed)
-        {
-          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                       "Can't manually register a Flatpak application");
-          return NULL;
-        }
-
-      if (!xdp_is_snap (pid, &is_sandboxed, error))
-        return NULL;
-
-      if (is_sandboxed)
-        {
-          g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                       "Can't manually register a Snap application");
-          return NULL;
-        }
-
-      app_info = xdp_app_info_host_new_registered (&pidfd, app_id, error);
-      if (!app_info)
-        return NULL;
-    }
-
-  g_debug ("Adding registered host app '%s'", xdp_app_info_get_id (app_info));
-
-  cache_insert_app_info (sender, app_info);
-
-  xdp_connection_track_name_owners (connection, on_peer_died);
-
-  return g_steal_pointer (&app_info);
-}
-
-XdpAppInfo *
-xdp_invocation_ensure_app_info_sync (GDBusMethodInvocation  *invocation,
-                                     GCancellable           *cancellable,
-                                     GError                **error)
-{
-  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
-  const char *sender = g_dbus_method_invocation_get_sender (invocation);
-  g_autoptr(XdpAppInfo) app_info = NULL;
-
-  app_info = cache_lookup_app_info_by_sender (sender);
-  if (app_info)
-    return g_steal_pointer (&app_info);
-
-  return xdp_connection_create_app_info_sync (connection,
-                                              sender,
-                                              cancellable,
-                                              error);
-}
-
-XdpAppInfo *
-xdp_invocation_register_host_app_info_sync (GDBusMethodInvocation  *invocation,
-                                            const char             *app_id,
-                                            GCancellable           *cancellable,
-                                            GError                **error)
-{
-  GDBusConnection *connection = g_dbus_method_invocation_get_connection (invocation);
-  const char *sender = g_dbus_method_invocation_get_sender (invocation);
-
-  if (cache_has_app_info_by_sender (sender))
-    {
-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
-                   "Connection already associated with an application ID");
-      return NULL;
-    }
-
-  return xdp_connection_create_host_app_info_sync (connection,
-                                                   sender,
-                                                   app_id,
-                                                   cancellable,
-                                                   error);
 }

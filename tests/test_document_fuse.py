@@ -2,7 +2,7 @@
 #
 # This file is formatted with Python Black
 
-import tests as xdp
+import tests.xdp_utils as xdp
 
 import pytest
 import errno
@@ -17,8 +17,8 @@ from gi.repository import Gio, GLib
 
 
 @pytest.fixture
-def app_id():
-    return None
+def xdp_app_info() -> xdp.AppInfo:
+    return xdp.AppInfoHost(app_id="")
 
 
 def filename_to_ay(filename):

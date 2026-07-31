@@ -2,10 +2,10 @@
 #
 # This file is formatted with Python Black
 
-import tests as xdp
+import tests.xdp_utils as xdp
 
-import pytest
 import os
+import pytest
 import tempfile
 from pathlib import Path
 from gi.repository import GLib
@@ -17,8 +17,11 @@ class TestTrash:
 
     def test_trash_file_fails(self, portals, dbus_con):
         trash_intf = xdp.get_portal_iface(dbus_con, "Trash")
-        with open("/proc/cmdline") as fd:
-            result = trash_intf.TrashFile(fd.fileno())
+        try:
+            with open("/proc/cmdline") as fd:
+                result = trash_intf.TrashFile(fd.fileno())
+        except PermissionError as e:
+            pytest.skip(f"Couldn't open file /proc/cmdline: {e}")
 
         assert result == 0
 
@@ -53,6 +56,7 @@ class TestTrash:
         with pytest.raises(StopIteration):
             next(trashed_files)
 
+    @pytest.mark.skip(reason="Portal requires write perm, so dirs are not supported")
     def test_trash_folder(self, portals, dbus_con):
         trash_intf = xdp.get_portal_iface(dbus_con, "Trash")
 

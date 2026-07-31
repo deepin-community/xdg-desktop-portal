@@ -22,22 +22,23 @@
 
 #include "config.h"
 
-#include <string.h>
+#include "notification.h"
+
 #include <stdio.h>
+#include <string.h>
+
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include <gio/gunixoutputstream.h>
 
-#include "notification.h"
-#include "xdp-call.h"
-#include "xdp-permissions.h"
-#include "xdp-request.h"
+#include "xdp-app-info-registry.h"
 #include "xdp-app-info.h"
+#include "xdp-context.h"
 #include "xdp-dbus.h"
+#include "xdp-permissions.h"
+#include "xdp-portal-config.h"
+#include "xdp-request.h"
 #include "xdp-utils.h"
-
-#define PERMISSION_TABLE "notifications"
-#define PERMISSION_ID "notification"
 
 typedef struct _Notification Notification;
 typedef struct _NotificationClass NotificationClass;
@@ -45,18 +46,18 @@ typedef struct _NotificationClass NotificationClass;
 struct _Notification
 {
   XdpDbusNotificationSkeleton parent_instance;
+
+  XdpDbusImplNotification *impl;
+  guint32 impl_version;
+
+  GHashTable *active; /* Pair *notification -> char *sender */
+  GMutex active_mutex;
 };
 
 struct _NotificationClass
 {
   XdpDbusNotificationSkeletonClass parent_class;
 };
-
-static XdpDbusImplNotification *impl;
-static Notification *notification;
-static guint32 impl_version;
-G_LOCK_DEFINE (active);
-static GHashTable *active;
 
 typedef struct {
   char *app_id;
@@ -105,20 +106,21 @@ pair_copy (Pair *o)
 
 struct _CallData {
   GObject parent_instance;
+
+  Notification *notification;
   GDBusMethodInvocation *inv;
   XdpAppInfo *app_info;
   GMutex mutex;
 
   char *sender;
   char *id;
-  GVariant *notification;
+  GVariant *notification_data;
   GUnixFDList *in_fd_list;
   GUnixFDList *out_fd_list;
 };
 
-G_DECLARE_FINAL_TYPE (CallData, call_data, CALL, DATA, GObject)
-G_DEFINE_TYPE (CallData, call_data, G_TYPE_OBJECT);
-#define CALL_DATA_AUTOLOCK(call_data) G_GNUC_UNUSED __attribute__((cleanup (auto_unlock_helper))) GMutex * G_PASTE (request_auto_unlock, __LINE__) = auto_lock_helper (&call_data->mutex);
+G_DECLARE_FINAL_TYPE (CallData, call_data, CALL, DATA, GObject);
+G_DEFINE_FINAL_TYPE (CallData, call_data, G_TYPE_OBJECT);
 
 static void
 call_data_init (CallData *call_data)
@@ -127,21 +129,23 @@ call_data_init (CallData *call_data)
 }
 
 static CallData *
-call_data_new (GDBusMethodInvocation *inv,
+call_data_new (Notification          *notification,
+               GDBusMethodInvocation *inv,
                XdpAppInfo            *app_info,
                const char            *sender,
                const char            *id,
-               GVariant              *notification,
+               GVariant              *notification_data,
                GUnixFDList           *in_fd_list)
 {
   CallData *call_data = g_object_new (call_data_get_type(),  NULL);
 
+  call_data->notification = g_object_ref (notification);
   call_data->inv = g_object_ref (inv);
   call_data->app_info = g_object_ref (app_info);
   call_data->sender = g_strdup (sender);
   call_data->id = g_strdup (id);
-  if (notification)
-    call_data->notification = g_variant_ref (notification);
+  if (notification_data)
+    call_data->notification_data = g_variant_ref (notification_data);
   g_set_object (&call_data->in_fd_list, in_fd_list);
   call_data->out_fd_list = g_unix_fd_list_new ();
 
@@ -153,11 +157,12 @@ call_data_finalize (GObject *object)
 {
   CallData *call_data = CALL_DATA (object);
 
+  g_clear_object (&call_data->notification);
   g_clear_object (&call_data->inv);
   g_clear_object (&call_data->app_info);
   g_clear_pointer (&call_data->id, g_free);
   g_clear_pointer (&call_data->sender, g_free);
-  g_clear_pointer (&call_data->notification, g_variant_unref);
+  g_clear_pointer (&call_data->notification_data, g_variant_unref);
   g_clear_object (&call_data->in_fd_list);
   g_clear_object (&call_data->out_fd_list);
 
@@ -180,12 +185,16 @@ G_DEFINE_TYPE_WITH_CODE (Notification, notification,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_NOTIFICATION,
                                                 notification_iface_init));
 
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (Notification, g_object_unref)
+
 static void
 add_done (GObject *source,
           GAsyncResult *result,
           gpointer data)
 {
+  XdpDbusImplNotification *impl = XDP_DBUS_IMPL_NOTIFICATION (source);
   g_autoptr(CallData) call_data = data;
+  Notification *notification = call_data->notification;
   g_autoptr(GError) error = NULL;
 
   if (!xdp_dbus_impl_notification_call_add_notification_finish (impl, NULL, result, &error))
@@ -197,30 +206,38 @@ add_done (GObject *source,
     {
       Pair p;
 
+      G_MUTEX_AUTO_LOCK (&notification->active_mutex, locker);
+
       p.app_id = (char *)xdp_app_info_get_id (call_data->app_info);
       p.id = call_data->id;
 
-      G_LOCK (active);
-      g_hash_table_insert (active, pair_copy (&p), g_strdup (call_data->sender));
-      G_UNLOCK (active);
+      g_hash_table_insert (notification->active,
+                           pair_copy (&p),
+                           g_strdup (call_data->sender));
     }
 }
 
 static gboolean
-get_notification_allowed (const char *app_id)
+get_notification_allowed (XdpAppInfo *app_info)
 {
   XdpPermission permission;
 
-  permission = xdp_get_permission_sync (app_id, PERMISSION_TABLE, PERMISSION_ID);
+  permission = xdp_get_permission_sync (app_info,
+                                        NOTIFICATION_PERMISSION_TABLE,
+                                        NOTIFICATION_PERMISSION_ID);
 
   if (permission == XDP_PERMISSION_NO)
     return FALSE;
 
   if (permission == XDP_PERMISSION_UNSET)
     {
-      g_debug ("No notification permissions stored for %s: allowing", app_id);
+      g_debug ("No notification permissions stored for %s: allowing",
+               xdp_app_info_get_id (app_info));
 
-      xdp_set_permission_sync (app_id, PERMISSION_TABLE, PERMISSION_ID, XDP_PERMISSION_YES);
+      xdp_set_permission_sync (app_info,
+                               NOTIFICATION_PERMISSION_TABLE,
+                               NOTIFICATION_PERMISSION_ID,
+                               XDP_PERMISSION_YES);
     }
 
   return TRUE;
@@ -274,21 +291,21 @@ markup_parser_start_element (GMarkupParseContext  *context,
 {
   GString *composed = user_data;
 
-  if (strcmp (element_name, "b") == 0)
+  if (g_strcmp0 (element_name, "b") == 0)
     {
       g_string_append_len (composed, "<b>", -1);
     }
-  else if (strcmp (element_name, "i") == 0)
+  else if (g_strcmp0 (element_name, "i") == 0)
     {
       g_string_append_len (composed, "<i>", -1);
     }
-  else if (strcmp (element_name, "a") == 0)
+  else if (g_strcmp0 (element_name, "a") == 0)
     {
       int i;
 
       for (i = 0;  attribute_names[i]; i++)
         {
-          if (strcmp (attribute_names[i], "href") == 0)
+          if (g_strcmp0 (attribute_names[i], "href") == 0)
             {
               g_autofree char *escaped = g_markup_escape_text (attribute_values[i], -1);
 
@@ -307,11 +324,11 @@ markup_parser_end_element (GMarkupParseContext  *context,
 {
   GString *composed = user_data;
 
-  if (strcmp (element_name, "b") == 0)
+  if (g_strcmp0 (element_name, "b") == 0)
     g_string_append_len (composed, "</b>", -1);
-  else if (strcmp (element_name, "i") == 0)
+  else if (g_strcmp0 (element_name, "i") == 0)
     g_string_append_len (composed, "</i>", -1);
-  else if (strcmp (element_name, "a") == 0)
+  else if (g_strcmp0 (element_name, "a") == 0)
     g_string_append_len (composed, "</a>", -1);
 }
 
@@ -359,7 +376,7 @@ strip_multiple_spaces (const gchar *text,
         }
     }
 
-  return g_string_free (composed, FALSE);
+  return g_string_free_and_steal (composed);
 }
 
 
@@ -463,6 +480,7 @@ check_button_purpose (GVariant  *value,
 
 static gboolean
 parse_button (GVariantBuilder  *builder,
+              guint32           impl_version,
               GVariant         *button,
               GError          **error)
 {
@@ -480,7 +498,7 @@ parse_button (GVariantBuilder  *builder,
 
       g_variant_get_child (button, i, "{&sv}", &key, &value);
 
-      if (strcmp (key, "label") == 0)
+      if (g_strcmp0 (key, "label") == 0)
         {
           if (!check_value_type (key, value, G_VARIANT_TYPE_STRING, error))
             return FALSE;
@@ -488,7 +506,7 @@ parse_button (GVariantBuilder  *builder,
           if (!label)
             label = g_steal_pointer (&value);
         }
-      else if (strcmp (key, "action") == 0)
+      else if (g_strcmp0 (key, "action") == 0)
         {
           if (!check_value_type (key, value, G_VARIANT_TYPE_STRING, error))
             return FALSE;
@@ -496,12 +514,12 @@ parse_button (GVariantBuilder  *builder,
           if (!action)
             action = g_steal_pointer (&value);
         }
-      else if (strcmp (key, "target") == 0)
+      else if (g_strcmp0 (key, "target") == 0)
         {
           if (!target)
             target = g_steal_pointer (&value);
         }
-      else if (strcmp (key, "purpose") == 0 && impl_version > 1)
+      else if (g_strcmp0 (key, "purpose") == 0 && impl_version > 1)
         {
           if (!check_button_purpose (value, error))
             return FALSE;
@@ -549,6 +567,7 @@ parse_button (GVariantBuilder  *builder,
 
 static gboolean
 parse_buttons (GVariantBuilder  *builder,
+               guint32           impl_version,
                GVariant         *value,
                GError          **error)
 {
@@ -567,7 +586,7 @@ parse_buttons (GVariantBuilder  *builder,
     {
       g_autoptr(GVariant) button = g_variant_get_child_value (value, i);
 
-      if (!parse_button (builder, button, error))
+      if (!parse_button (builder, impl_version, button, error))
         {
           g_prefix_error (error, "invalid button: ");
           result = FALSE;
@@ -584,6 +603,7 @@ parse_buttons (GVariantBuilder  *builder,
 
 static gboolean
 parse_serialized_icon (GVariantBuilder  *builder,
+                       guint32           impl_version,
                        GVariant         *icon,
                        GUnixFDList      *in_fd_list,
                        GUnixFDList      *out_fd_list,
@@ -624,14 +644,14 @@ parse_serialized_icon (GVariantBuilder  *builder,
   g_variant_get (icon, "(&sv)", &key, &value);
 
   /* This are the same keys as for serialized GIcons */
-  if (strcmp (key, "themed") == 0)
+  if (g_strcmp0 (key, "themed") == 0)
     {
       if (!check_value_type (key, value, G_VARIANT_TYPE_STRING_ARRAY, error))
         return FALSE;
 
       g_variant_builder_add (builder, "{sv}", "icon", icon);
     }
-  else if (strcmp (key, "bytes") == 0)
+  else if (g_strcmp0 (key, "bytes") == 0)
     {
       g_autoptr(GBytes) icon_bytes = NULL;
       g_autoptr(GError) local_error = NULL;
@@ -674,7 +694,7 @@ parse_serialized_icon (GVariantBuilder  *builder,
             }
         }
     }
-  else if (strcmp (key, "file-descriptor") == 0)
+  else if (g_strcmp0 (key, "file-descriptor") == 0)
     {
       g_autoptr(GError) local_error = NULL;
       g_autoptr(XdpSealedFd) sealed_icon = NULL;
@@ -755,7 +775,7 @@ parse_serialized_sound (GVariantBuilder  *builder,
     {
       key = g_variant_get_string (sound, NULL);
 
-      if (strcmp (key, "silent") == 0 || strcmp (key, "default") == 0)
+      if (g_strcmp0 (key, "silent") == 0 || g_strcmp0 (key, "default") == 0)
         {
           g_variant_builder_add (builder, "{sv}", "sound", sound);
           return TRUE;
@@ -775,7 +795,7 @@ parse_serialized_sound (GVariantBuilder  *builder,
 
   g_variant_get (sound, "(&sv)", &key, &value);
 
-  if (strcmp (key, "file-descriptor") == 0)
+  if (g_strcmp0 (key, "file-descriptor") == 0)
     {
       g_autoptr(GError) local_error = NULL;
       g_autoptr(XdpSealedFd) sealed_sound = NULL;
@@ -893,9 +913,11 @@ parse_category (GVariantBuilder  *builder,
     "call.ongoing",
     "call.unanswered",
     "weather.warning.extreme",
+    "cellbroadcast.danger.presidential",
     "cellbroadcast.danger.extreme",
     "cellbroadcast.danger.severe",
-    "cellbroadcast.amberalert",
+    "cellbroadcast.public-safety",
+    "cellbroadcast.amber-alert",
     "cellbroadcast.test",
     "os.battery.low",
     "browser.web-notification",
@@ -923,6 +945,7 @@ parse_category (GVariantBuilder  *builder,
 
 static gboolean
 parse_notification (GVariantBuilder  *builder,
+                    guint32           impl_version,
                     GVariant         *notification,
                     GUnixFDList      *in_fd_list,
                     GUnixFDList      *out_fd_list,
@@ -939,22 +962,23 @@ parse_notification (GVariantBuilder  *builder,
       g_autoptr(GVariant) value = NULL;
 
       g_variant_get_child (notification, i, "{&sv}", &key, &value);
-      if (strcmp (key, "title") == 0 ||
-          strcmp (key, "body") == 0)
+      if (g_strcmp0 (key, "title") == 0 ||
+          g_strcmp0 (key, "body") == 0)
         {
           if (!check_value_type (key, value, G_VARIANT_TYPE_STRING, error))
             return FALSE;
 
           g_variant_builder_add (builder, "{sv}", key, value);
         }
-      else if (strcmp (key, "markup-body") == 0 && impl_version > 1)
+      else if (g_strcmp0 (key, "markup-body") == 0 && impl_version > 1)
         {
           if (!parse_markup_body (builder, value, error))
             return FALSE;
         }
-      else if (strcmp (key, "icon") == 0)
+      else if (g_strcmp0 (key, "icon") == 0)
         {
           if (!parse_serialized_icon (builder,
+                                      impl_version,
                                       value,
                                       in_fd_list,
                                       out_fd_list,
@@ -964,7 +988,7 @@ parse_notification (GVariantBuilder  *builder,
               return FALSE;
             }
         }
-      else if (strcmp (key, "sound") == 0 && impl_version > 1)
+      else if (g_strcmp0 (key, "sound") == 0 && impl_version > 1)
         {
           if (!parse_serialized_sound (builder,
                                        value,
@@ -976,33 +1000,33 @@ parse_notification (GVariantBuilder  *builder,
               return FALSE;
             }
         }
-      else if (strcmp (key, "priority") == 0)
+      else if (g_strcmp0 (key, "priority") == 0)
         {
           if (!parse_priority (builder, value, error))
             return FALSE;
         }
-      else if (strcmp (key, "default-action") == 0)
+      else if (g_strcmp0 (key, "default-action") == 0)
         {
           if (!check_value_type (key, value, G_VARIANT_TYPE_STRING, error))
             return FALSE;
 
           g_variant_builder_add (builder, "{sv}", key, value);
         }
-      else if (strcmp (key, "default-action-target") == 0)
+      else if (g_strcmp0 (key, "default-action-target") == 0)
         {
           g_variant_builder_add (builder, "{sv}", key, value);
         }
-      else if (strcmp (key, "buttons") == 0)
+      else if (g_strcmp0 (key, "buttons") == 0)
         {
-          if (!parse_buttons (builder, value, error))
+          if (!parse_buttons (builder, impl_version, value, error))
             return FALSE;
         }
-      else if (strcmp (key, "display-hint") == 0 && impl_version > 1)
+      else if (g_strcmp0 (key, "display-hint") == 0 && impl_version > 1)
         {
           if (!parse_display_hint (builder, value, error))
             return FALSE;
         }
-      else if (strcmp (key, "category") == 0 && impl_version > 1)
+      else if (g_strcmp0 (key, "category") == 0 && impl_version > 1)
         {
           if (!parse_category (builder, value, error))
             return FALSE;
@@ -1042,15 +1066,16 @@ handle_add_in_thread_func (GTask        *task,
                            gpointer      task_data,
                            GCancellable *cancellable)
 {
+  Notification *notification = source_object;
   CallData *call_data = task_data;
   g_auto(GVariantBuilder) builder =
     G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
   g_autoptr(GError) error = NULL;
 
-  CALL_DATA_AUTOLOCK (call_data);
+  G_MUTEX_AUTO_LOCK (&call_data->mutex, call_data_locker);
 
   if (!xdp_app_info_is_host (call_data->app_info) &&
-      !get_notification_allowed (xdp_app_info_get_id (call_data->app_info)))
+      !get_notification_allowed (call_data->app_info))
     {
       g_set_error_literal (&error,
                            XDG_DESKTOP_PORTAL_ERROR,
@@ -1062,7 +1087,8 @@ handle_add_in_thread_func (GTask        *task,
     }
 
   if (!parse_notification (&builder,
-                           call_data->notification,
+                           call_data->notification->impl_version,
+                           call_data->notification_data,
                            call_data->in_fd_list,
                            call_data->out_fd_list,
                            &error))
@@ -1072,7 +1098,7 @@ handle_add_in_thread_func (GTask        *task,
       return;
     }
 
-  xdp_dbus_impl_notification_call_add_notification (impl,
+  xdp_dbus_impl_notification_call_add_notification (notification->impl,
                                                     xdp_app_info_get_id (call_data->app_info),
                                                     call_data->id,
                                                     g_variant_builder_end (&builder),
@@ -1085,23 +1111,26 @@ handle_add_in_thread_func (GTask        *task,
 }
 
 static gboolean
-notification_handle_add_notification (XdpDbusNotification *object,
+notification_handle_add_notification (XdpDbusNotification   *object,
                                       GDBusMethodInvocation *invocation,
-                                      GUnixFDList *in_fd_list,
-                                      const char *arg_id,
-                                      GVariant *notification)
+                                      GUnixFDList           *in_fd_list,
+                                      const char            *arg_id,
+                                      GVariant              *notification_data)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  Notification *notification = (Notification *) object;
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
   g_autoptr(GTask) task = NULL;
   CallData *call_data;
 
-  call_data = call_data_new (invocation,
-                             call->app_info,
-                             call->sender,
+  call_data = call_data_new (notification,
+                             invocation,
+                             app_info,
+                             xdp_app_info_get_sender (app_info),
                              arg_id,
-                             notification,
+                             notification_data,
                              in_fd_list);
-  task = g_task_new (object, NULL, add_finished_cb, NULL);
+  task = g_task_new (notification, NULL, add_finished_cb, NULL);
+  g_task_set_source_tag (task, notification_handle_add_notification);
   g_task_set_task_data (task, call_data, g_object_unref);
   g_task_run_in_thread (task, handle_add_in_thread_func);
 
@@ -1113,7 +1142,9 @@ remove_done (GObject *source,
              GAsyncResult *result,
              gpointer data)
 {
+  XdpDbusImplNotification *impl = XDP_DBUS_IMPL_NOTIFICATION (source);
   g_autoptr(CallData) call_data = data;
+  Notification *notification = call_data->notification;
   g_autoptr(GError) error = NULL;
 
   if (!xdp_dbus_impl_notification_call_remove_notification_finish (impl, result, &error))
@@ -1125,30 +1156,32 @@ remove_done (GObject *source,
     {
       Pair p;
 
+      G_MUTEX_AUTO_LOCK (&notification->active_mutex, locker);
+
       p.app_id = (char *)xdp_app_info_get_id (call_data->app_info);
       p.id = call_data->id;
 
-      G_LOCK (active);
-      g_hash_table_remove (active, &p);
-      G_UNLOCK (active);
+      g_hash_table_remove (notification->active, &p);
     }
 }
 
 static gboolean
-notification_handle_remove_notification (XdpDbusNotification *object,
+notification_handle_remove_notification (XdpDbusNotification   *object,
                                          GDBusMethodInvocation *invocation,
-                                         const char *arg_id)
+                                         const char            *arg_id)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
-  CallData *call_data = call_data_new (invocation,
-                                       call->app_info,
-                                       call->sender,
+  Notification *notification = (Notification *) object;
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
+  CallData *call_data = call_data_new (notification,
+                                       invocation,
+                                       app_info,
+                                       xdp_app_info_get_sender (app_info),
                                        arg_id,
                                        NULL,
                                        NULL);
 
-  xdp_dbus_impl_notification_call_remove_notification (impl,
-                                                       xdp_app_info_get_id (call->app_info),
+  xdp_dbus_impl_notification_call_remove_notification (notification->impl,
+                                                       xdp_app_info_get_id (app_info),
                                                        arg_id,
                                                        NULL,
                                                        remove_done, call_data);
@@ -1159,68 +1192,62 @@ notification_handle_remove_notification (XdpDbusNotification *object,
 }
 
 static void
-action_invoked (GDBusConnection *connection,
-                const gchar     *sender_name,
-                const gchar     *object_path,
-                const gchar     *interface_name,
-                const gchar     *signal_name,
-                GVariant        *parameters,
-                gpointer         user_data)
+action_invoked_cb (XdpDbusImplNotification *impl,
+                   const char              *arg_app_id,
+                   const char              *arg_id,
+                   const char              *arg_action,
+                   GVariant                *arg_parameter,
+                   gpointer                 user_data)
 {
-   Pair p;
-   const char *action;
-   GVariant *param;
-   const char *sender;
+  Notification *notification = user_data;
+  Pair p;
 
-   g_variant_get (parameters, "(&s&s&s@av)", &p.app_id, &p.id, &action, &param);
+  {
+    G_MUTEX_AUTO_LOCK (&notification->active_mutex, locker);
 
-   sender = g_hash_table_lookup (active, &p);
-   if (sender == NULL)
-     return;
+    p.app_id = (char *) arg_app_id;
+    p.id = (char *) arg_id;
 
-   g_dbus_connection_emit_signal (connection,
-                                  sender,
-                                  "/org/freedesktop/portal/desktop",
-                                  "org.freedesktop.portal.Notification",
-                                  "ActionInvoked",
-                                  g_variant_new ("(ss@av)",
-                                                 p.id, action,
-                                                 param),
-                                  NULL);
+    if (g_hash_table_lookup (notification->active, &p) == NULL)
+      return;
+  }
 
+  xdp_dbus_notification_emit_action_invoked (XDP_DBUS_NOTIFICATION (notification),
+                                             arg_id,
+                                             arg_action,
+                                             arg_parameter);
 }
 
 static void
-name_owner_changed (GDBusConnection *connection,
-                    const gchar     *sender_name,
-                    const gchar     *object_path,
-                    const gchar     *interface_name,
-                    const gchar     *signal_name,
-                    GVariant        *parameters,
-                    gpointer         user_data)
+on_peer_disconnect (XdpContext *context,
+                    const char *sender,
+                    gpointer    user_data)
 {
-  const char *name, *from, *to;
+  Notification *notification = user_data;
+  XdpAppInfoRegistry *registry;
+  g_autoptr(XdpAppInfo) sender_app_info = NULL;
+  const char *sender_app_id;
 
-  g_variant_get (parameters, "(&s&s&s)", &name, &from, &to);
+  registry = xdp_context_get_app_info_registry (context);
+  sender_app_info = xdp_app_info_registry_lookup_sender (registry, sender);
+  if (!sender_app_info)
+    return;
 
-  if (name[0] == ':' &&
-      strcmp (name, from) == 0 &&
-      strcmp (to, "") == 0)
-    {
-      GHashTableIter iter;
-      Pair *p;
+  sender_app_id = xdp_app_info_get_id (sender_app_info);
 
-      G_LOCK (active);
+  {
+    GHashTableIter iter;
+    Pair *p;
 
-      g_hash_table_iter_init (&iter, active);
-      while (g_hash_table_iter_next (&iter, (gpointer *)&p, NULL))
-        {
-          if (g_strcmp0 (p->app_id, name) == 0)
-            g_hash_table_iter_remove (&iter);
-        }
+    G_MUTEX_AUTO_LOCK (&notification->active_mutex, locker);
 
-      G_UNLOCK (active);
-    }
+    g_hash_table_iter_init (&iter, notification->active);
+    while (g_hash_table_iter_next (&iter, (gpointer *)&p, NULL))
+      {
+        if (g_strcmp0 (p->app_id, sender_app_id) == 0)
+          g_hash_table_iter_remove (&iter);
+      }
+  }
 }
 
 static void
@@ -1231,64 +1258,101 @@ notification_iface_init (XdpDbusNotificationIface *iface)
 }
 
 static void
+notification_dispose (GObject *object)
+{
+  Notification *notification = (Notification *) object;
+
+  g_clear_object (&notification->impl);
+
+  if (notification->active)
+    {
+      g_mutex_clear (&notification->active_mutex);
+      g_clear_pointer (&notification->active, g_hash_table_unref);
+    }
+
+  G_OBJECT_CLASS (notification_parent_class)->dispose (object);
+}
+
+static void
 notification_init (Notification *notification)
 {
-  xdp_dbus_notification_set_version (XDP_DBUS_NOTIFICATION (notification), 2);
-  g_object_bind_property (G_OBJECT (impl), "supported-options",
-                          G_OBJECT (notification), "supported-options",
-                          G_BINDING_SYNC_CREATE);
 }
 
 static void
 notification_class_init (NotificationClass *klass)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->dispose = notification_dispose;
 }
 
-GDBusInterfaceSkeleton *
-notification_create (GDBusConnection *connection,
-                     const char *dbus_name)
+static Notification *
+notification_new (XdpContext              *context,
+                  XdpDbusImplNotification *impl)
 {
+  Notification *notification = NULL;
+
+  notification = g_object_new (notification_get_type (), NULL);
+  notification->impl = g_object_ref (impl);
+
+  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (notification->impl), G_MAXINT);
+
+  notification->impl_version =
+    MAX (xdp_dbus_impl_notification_get_version (notification->impl), 1);
+  xdp_dbus_notification_set_version (XDP_DBUS_NOTIFICATION (notification),
+                                     MIN (notification->impl_version, 2));
+
+  g_object_bind_property (G_OBJECT (notification->impl), "supported-options",
+                          G_OBJECT (notification), "supported-options",
+                          G_BINDING_SYNC_CREATE);
+
+  notification->active =
+    g_hash_table_new_full (pair_hash, pair_equal,
+                           pair_free,
+                           g_free);
+  g_mutex_init (&notification->active_mutex);
+
+  g_signal_connect_object (notification->impl, "action-invoked",
+                           G_CALLBACK (action_invoked_cb),
+                           notification,
+                           G_CONNECT_DEFAULT);
+
+  g_signal_connect_object (context, "peer-disconnect",
+                           G_CALLBACK (on_peer_disconnect),
+                           notification,
+                           G_CONNECT_DEFAULT);
+
+  return notification;
+}
+
+void
+init_notification (XdpContext *context)
+{
+  g_autoptr(Notification) notification = NULL;
+  GDBusConnection *connection = xdp_context_get_connection (context);
+  XdpPortalConfig *config = xdp_context_get_config (context);
+  XdpImplConfig *impl_config;
+  g_autoptr(XdpDbusImplNotification) impl = NULL;
   g_autoptr(GError) error = NULL;
-  g_autoptr(GVariant) version = NULL;
+
+  impl_config = xdp_portal_config_find (config, NOTIFICATION_DBUS_IMPL_IFACE);
+  if (impl_config == NULL)
+    return;
 
   impl = xdp_dbus_impl_notification_proxy_new_sync (connection,
                                                     G_DBUS_PROXY_FLAGS_NONE,
-                                                    dbus_name,
-                                                    DESKTOP_PORTAL_OBJECT_PATH,
+                                                    impl_config->dbus_name,
+                                                    DESKTOP_DBUS_PATH,
                                                     NULL, &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create notification proxy: %s", error->message);
-      return NULL;
+      return;
     }
 
-  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (impl), G_MAXINT);
+  notification = notification_new (context, impl);
 
-  notification = g_object_new (notification_get_type (), NULL);
-  active = g_hash_table_new_full (pair_hash, pair_equal, pair_free, g_free);
-
-  version = g_dbus_proxy_get_cached_property (G_DBUS_PROXY (impl), "version");
-  impl_version = (version != NULL) ? g_variant_get_uint32 (version) : 1;
-
-  g_dbus_connection_signal_subscribe (connection,
-                                      dbus_name,
-                                      "org.freedesktop.impl.portal.Notification",
-                                      "ActionInvoked",
-                                      DESKTOP_PORTAL_OBJECT_PATH,
-                                      NULL,
-                                      G_DBUS_SIGNAL_FLAGS_NONE,
-                                      action_invoked,
-                                      NULL, NULL);
-
-  g_dbus_connection_signal_subscribe (connection,
-                                      "org.freedesktop.DBus",
-                                      "org.freedesktop.DBus",
-                                      "NameOwnerChanged",
-                                      "/org/freedesktop/DBus",
-                                      NULL,
-                                      G_DBUS_SIGNAL_FLAGS_NONE,
-                                      name_owner_changed,
-                                      NULL, NULL);
-
-  return G_DBUS_INTERFACE_SKELETON (notification);
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&notification)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }

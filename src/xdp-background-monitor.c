@@ -20,8 +20,10 @@
 
 #include "xdp-background-monitor.h"
 
-#define BACKGROUND_MONITOR_BUS_NAME "org.freedesktop.background.Monitor"
-#define BACKGROUND_MONITOR_OBJECT_PATH "/org/freedesktop/background/monitor"
+#include "xdp-utils.h"
+
+#define BACKGROUND_MONITOR_DBUS_NAME "org.freedesktop.background.Monitor"
+#define BACKGROUND_MONITOR_DBUS_PATH "/org/freedesktop/background/monitor"
 
 struct _XdpBackgroundMonitor
 {
@@ -32,10 +34,10 @@ struct _XdpBackgroundMonitor
 
 static void g_initable_iface_init (GInitableIface *iface);
 
-G_DEFINE_TYPE_WITH_CODE (XdpBackgroundMonitor,
-                         xdp_background_monitor,
-                         XDP_DBUS_BACKGROUND_TYPE_MONITOR_SKELETON,
-                         G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE, g_initable_iface_init))
+G_DEFINE_FINAL_TYPE_WITH_CODE (XdpBackgroundMonitor,
+                               xdp_background_monitor,
+                               XDP_DBUS_BACKGROUND_TYPE_MONITOR_SKELETON,
+                               G_IMPLEMENT_INTERFACE (G_TYPE_INITABLE, g_initable_iface_init));
 
 static gboolean
 request_freedesktop_background_name (XdpBackgroundMonitor  *self,
@@ -52,11 +54,11 @@ request_freedesktop_background_name (XdpBackgroundMonitor  *self,
 #endif
 
   reply = g_dbus_connection_call_sync (self->connection,
-                                       "org.freedesktop.DBus",
-                                       "/org/freedesktop/DBus",
-                                       "org.freedesktop.DBus",
+                                       DBUS_DBUS_NAME,
+                                       DBUS_DBUS_PATH,
+                                       DBUS_DBUS_IFACE,
                                        "RequestName",
-                                       g_variant_new ("(su)", BACKGROUND_MONITOR_BUS_NAME, flags),
+                                       g_variant_new ("(su)", BACKGROUND_MONITOR_DBUS_NAME, flags),
                                        G_VARIANT_TYPE ("(u)"),
                                        0, -1,
                                        cancellable,
@@ -109,7 +111,7 @@ xdp_background_monitor_initable_init (GInitable     *initable,
 
   if (!g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (initable),
                                          self->connection,
-                                         BACKGROUND_MONITOR_OBJECT_PATH,
+                                         BACKGROUND_MONITOR_DBUS_PATH,
                                          error))
     {
       return FALSE;

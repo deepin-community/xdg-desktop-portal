@@ -137,10 +137,6 @@
 
           Whether to make the dialog modal. Default is yes.
 
-        * ``multiple`` (``b``)
-
-          Whether to allow selection of multiple files. Default is no.
-
         * ``filters`` (``a(sa(us))``)
 
           A list of serialized file filters.
@@ -172,8 +168,8 @@
 
         * ``uris`` (``as``)
 
-          An array of strings containing the uri of the selected file. All
-          URIs must have the "file://" scheme.
+          An array of strings containing the uri of the selected file. It must
+          have exactly one element. All URIs must have the "file://" scheme.
 
         * ``choices`` (``a(ss)``)
 

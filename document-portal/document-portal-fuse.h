@@ -1,5 +1,4 @@
-#ifndef XDP_FUSE_H
-#define XDP_FUSE_H
+#pragma once
 
 #include <glib.h>
 #include "permission-db.h"
@@ -9,6 +8,7 @@ G_BEGIN_DECLS
 char **        xdp_list_apps (void);
 char **        xdp_list_docs (void);
 PermissionDbEntry *xdp_lookup_doc (const char *doc_id);
+GBytes *       xdp_file_handle_for_fd (int fd);
 
 gboolean    xdp_fuse_init (GError **error);
 void        xdp_fuse_exit (void);
@@ -21,5 +21,3 @@ char      *xdp_fuse_lookup_id_for_inode (ino_t    inode,
 
 
 G_END_DECLS
-
-#endif /* XDP_FUSE_H */

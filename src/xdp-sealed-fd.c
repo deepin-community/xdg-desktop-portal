@@ -22,15 +22,17 @@
 
 #include "config.h"
 
+#include "xdp-sealed-fd.h"
+
 #include <errno.h>
 #include <fcntl.h>
-#include <gio/gunixfdlist.h>
-#include <sys/mman.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
+#include <gio/gunixfdlist.h>
+
 #include "xdp-utils.h"
-#include "xdp-sealed-fd.h"
 
 #define REQUIRED_SEALS (F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SHRINK)
 
@@ -41,7 +43,7 @@ struct _XdpSealedFd
   int fd;
 };
 
-G_DEFINE_FINAL_TYPE (XdpSealedFd, xdp_sealed_fd, G_TYPE_OBJECT)
+G_DEFINE_FINAL_TYPE (XdpSealedFd, xdp_sealed_fd, G_TYPE_OBJECT);
 
 static void
 xdp_sealed_fd_finalize (GObject *object)
@@ -220,7 +222,7 @@ xdp_sealed_fd_new_from_handle (GVariant     *handle,
     }
 
   fd_id = g_variant_get_handle (handle);
-  if (fd_id >= g_unix_fd_list_get_length (fd_list))
+  if (!xdp_is_fd_list_index_valid (fd_list, fd_id))
     {
       g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
                            "Invalid file descriptor: index not found");

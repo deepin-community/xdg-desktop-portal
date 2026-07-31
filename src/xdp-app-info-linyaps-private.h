@@ -1,5 +1,5 @@
 /*
- * Copyright © 2016 Red Hat, Inc
+ * Copyright © 2025 UnionTech Software Technology Co., Ltd.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  *
@@ -17,24 +17,25 @@
  * License along with this library. If not, see <http://www.gnu.org/licenses/>.
  *
  * Authors:
- *       Alexander Larsson <alexl@redhat.com>
- *       Matthias Clasen <mclasen@redhat.com>
+ *       ComixHe <heyuming@deepin.org>
  */
 
 #pragma once
 
-#include <glib.h>
+#include "xdp-app-info-private.h"
 
-typedef struct {
-  char *source;
-  char *dbus_name;
-  char **interfaces;
-  char **use_in;
-  int priority;
-} XdpPortalImplementation;
+struct _XdpAppInfoLinyapsClass
+{
+  XdpAppInfoClass parent_class;
+};
 
-void load_installed_portals (gboolean opt_verbose);
-void load_portal_configuration (gboolean opt_verbose);
-XdpPortalImplementation *find_portal_implementation (const char *interface);
-GPtrArray *find_all_portal_implementations (const char *interface);
+#define XDP_TYPE_APP_INFO_LINYAPS (xdp_app_info_linyaps_get_type())
+G_DECLARE_FINAL_TYPE (XdpAppInfoLinyaps,
+                      xdp_app_info_linyaps,
+                      XDP, APP_INFO_LINYAPS,
+                      XdpAppInfo);
 
+XdpAppInfo * xdp_app_info_linyaps_new (const char *sender,
+                                       int         pid,
+                                       int        *pidfd,
+                                       GError    **error);

@@ -24,41 +24,34 @@
 
 #include "config.h"
 
+#include "document-portal.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
-#include "glib-backports.h"
+#include <glib-unix.h>
+#include <libglnx.h>
+
 #include "document-portal-dbus.h"
+#include "document-portal-fuse.h"
 #include "document-store.h"
-#include "src/xdp-app-info.h"
-#include "src/xdp-utils.h"
+#include "file-transfer.h"
 #include "permission-db.h"
 #include "permission-store-dbus.h"
-#include "document-portal-fuse.h"
-#include "file-transfer.h"
-#include "document-portal.h"
+#include "src/xdp-app-info-registry.h"
+#include "src/xdp-app-info.h"
+#include "src/xdp-utils.h"
 
 #define TABLE_NAME "documents"
-
-typedef struct
-{
-  char                  *doc_id;
-  int                    fd;
-  char                  *owner;
-  guint                  flags;
-
-  GDBusMethodInvocation *finish_invocation;
-} XdpDocUpdate;
-
 
 static GMainLoop *loop = NULL;
 static PermissionDb *db = NULL;
@@ -68,6 +61,8 @@ static GError *exit_error = NULL;
 static dev_t fuse_dev = 0;
 static GQueue get_mount_point_invocations = G_QUEUE_INIT;
 static XdpDbusDocuments *dbus_api;
+
+XdpAppInfoRegistry *app_info_registry;
 
 G_LOCK_DEFINE (db);
 
@@ -137,7 +132,7 @@ portal_grant_permissions (GDBusMethodInvocation *invocation,
   const char *id;
   g_autofree const char **permissions = NULL;
   DocumentPermissionFlags perms;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
 
   g_autoptr(PermissionDbEntry) entry = NULL;
 
@@ -166,7 +161,7 @@ portal_grant_permissions (GDBusMethodInvocation *invocation,
     perms = xdp_parse_permissions (permissions, &error);
     if (error)
       {
-        g_dbus_method_invocation_take_error (invocation, error);
+        g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
         return;
       }
 
@@ -199,7 +194,7 @@ portal_revoke_permissions (GDBusMethodInvocation *invocation,
   const char *target_app_id;
   const char *id;
   g_autofree const char **permissions = NULL;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
 
   g_autoptr(PermissionDbEntry) entry = NULL;
   DocumentPermissionFlags perms;
@@ -229,14 +224,14 @@ portal_revoke_permissions (GDBusMethodInvocation *invocation,
     perms = xdp_parse_permissions (permissions, &error);
     if (error)
       {
-        g_dbus_method_invocation_take_error (invocation, error);
+        g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
         return;
       }
 
     /* Must have grant-permissions, or be itself */
     if (!document_entry_has_permissions (entry, app_info,
                                     DOCUMENT_PERMISSION_FLAGS_GRANT_PERMISSIONS) ||
-        strcmp (app_id, target_app_id) == 0)
+        g_strcmp0 (app_id, target_app_id) == 0)
       {
         g_dbus_method_invocation_return_error (invocation,
                                                XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
@@ -307,13 +302,127 @@ portal_delete (GDBusMethodInvocation *invocation,
   g_dbus_method_invocation_return_value (invocation, g_variant_new ("()"));
 }
 
-static char *
-do_create_doc (struct stat *parent_st_buf, const char *path, gboolean reuse_existing, gboolean persistent, gboolean directory)
+GBytes *
+xdp_file_handle_for_fd (int fd)
 {
-  g_autoptr(GVariant) data = NULL;
+  g_autofree struct file_handle *handle = NULL;
+  g_autofd int fd_owned = -1;
+
+  if (!(fcntl (fd, F_GETFL) & O_PATH))
+    fd = fd_owned = glnx_fd_reopen (fd, O_PATH, NULL);
+
+  if (fd < 0 ||
+      !glnx_name_to_handle_at (fd, "",
+                               AT_EMPTY_PATH | AT_HANDLE_FID,
+                               &handle,
+                               NULL,
+                               NULL))
+    return NULL;
+
+  return g_bytes_new (handle->f_handle, handle->handle_bytes);
+}
+
+typedef struct _FindIdData {
+  const char *path;
+  dev_t       st_dev;
+  ino_t       st_ino;
+  GBytes     *handle;
+  uint32_t    flags;
+  gboolean    ignore_transient;
+} FindIdData;
+
+static gboolean
+find_id_matches (PermissionDbEntry *entry,
+                 gpointer           user_data)
+{
+  FindIdData *match = user_data;
+
+  if (g_strcmp0 (document_entry_get_path (entry), match->path) != 0)
+    return FALSE;
+
+  {
+    uint32_t flags = document_entry_get_flags (entry);
+
+    if (match->ignore_transient)
+      flags &= ~DOCUMENT_ENTRY_FLAG_TRANSIENT;
+
+    if (match->flags != flags)
+      return FALSE;
+  }
+
+  if (match->handle)
+    {
+      g_autoptr(GBytes) handle = NULL;
+
+      handle = document_entry_dup_handle (entry);
+      if (!handle || !g_bytes_equal (handle, match->handle))
+        return FALSE;
+    }
+  else
+    {
+      if (match->st_dev != document_entry_get_device (entry) ||
+          match->st_ino != document_entry_get_inode (entry))
+        return FALSE;
+    }
+
+  return TRUE;
+}
+
+static char *
+find_id (const char *path,
+         dev_t       st_dev,
+         ino_t       st_ino,
+         GBytes     *handle,
+         uint32_t    flags,
+         gboolean    ignore_transient)
+{
+  FindIdData find_data;
+
+  find_data = (FindIdData) {
+    .path = path,
+    .st_dev = st_dev,
+    .st_ino = st_ino,
+    .handle = handle,
+    .flags = flags,
+    .ignore_transient = ignore_transient,
+  };
+
+  {
+    g_auto(GStrv) ids = NULL;
+
+    ids = permission_db_filter_ids (db, find_id_matches, &find_data);
+    if (ids[0] != NULL)
+      return g_strdup (ids[0]);
+  }
+
+  /* We didn't have a handle, so we already checked by dev+ino */
+  if (find_data.handle == NULL)
+    return NULL;
+
+  /* We didn't find a match via handle, so fall back to checking by dev+ino */
+  {
+    g_auto(GStrv) ids = NULL;
+
+    find_data.handle = NULL;
+
+    ids = permission_db_filter_ids (db, find_id_matches, &find_data);
+    if (ids[0] != NULL)
+      return g_strdup (ids[0]);
+  }
+
+  return NULL;
+}
+
+static char *
+do_create_doc (struct stat *parent_st_buf,
+               GBytes      *handle,
+               const char  *path,
+               gboolean     reuse_existing,
+               gboolean     persistent,
+               gboolean     directory)
+{
   g_autoptr(PermissionDbEntry) entry = NULL;
-  g_auto(GStrv) ids = NULL;
-  char *id = NULL;
+  g_autofree char *id = NULL;
   guint32 flags = 0;
 
   g_debug ("Creating document at path '%s', reuse_existing: %d, persistent: %d, directory: %d", path, reuse_existing, persistent, directory);
@@ -324,39 +433,44 @@ do_create_doc (struct stat *parent_st_buf, const char *path, gboolean reuse_exis
     flags |= DOCUMENT_ENTRY_FLAG_TRANSIENT;
   if (directory)
     flags |= DOCUMENT_ENTRY_FLAG_DIRECTORY;
-  data =
-    g_variant_ref_sink (g_variant_new ("(^ayttu)",
-                                       path,
-                                       (guint64) parent_st_buf->st_dev,
-                                       (guint64) parent_st_buf->st_ino,
-                                       flags));
+
+  entry = document_entry_new (path, flags, parent_st_buf->st_dev, parent_st_buf->st_ino, handle);
 
   if (reuse_existing)
     {
-      ids = permission_db_list_ids_by_value (db, data);
-
-      if (ids[0] != NULL)
-        return g_strdup (ids[0]);  /* Reuse pre-existing entry with same path */
+      id = find_id (path,
+                    parent_st_buf->st_dev,
+                    parent_st_buf->st_ino,
+                    handle,
+                    flags,
+                    FALSE /* ignore_transient */);
     }
 
-  while (TRUE)
+  if (id)
     {
-      g_autoptr(PermissionDbEntry) existing = NULL;
+      g_debug ("reuse_doc %s", id);
+    }
+  else
+    {
+      while (id == NULL)
+        {
+          g_autoptr(PermissionDbEntry) existing = NULL;
 
-      g_clear_pointer (&id, g_free);
-      id = xdp_name_from_id ((guint32) g_random_int ());
-      existing = permission_db_lookup (db, id);
-      if (existing == NULL)
-        break;
+          id = xdp_generate_token ();
+          existing = permission_db_lookup (db, id);
+          if (existing)
+            g_clear_pointer (&id, g_free);
+        }
+
+      g_debug ("create_doc %s", id);
     }
 
-  g_debug ("create_doc %s", id);
-
-  entry = permission_db_entry_new (data);
   permission_db_set_entry (db, id, entry);
 
   if (persistent)
     {
+      g_autoptr(GVariant) data = permission_db_entry_get_data (entry);
+
       xdg_permission_store_call_set (permission_store,
                                      TABLE_NAME,
                                      TRUE,
@@ -366,7 +480,7 @@ do_create_doc (struct stat *parent_st_buf, const char *path, gboolean reuse_exis
                                      NULL, NULL, NULL);
     }
 
-  return id;
+  return g_steal_pointer (&id);
 }
 
 gboolean
@@ -375,6 +489,7 @@ validate_fd (int fd,
              ValidateFdType ensure_type,
              struct stat *st_buf,
              struct stat *real_dir_st_buf,
+             GBytes **real_dir_handle_out,
              char **path_out,
              gboolean *writable_out,
              GError **error)
@@ -414,6 +529,9 @@ validate_fd (int fd,
   dir_fd = open (dirname, O_CLOEXEC | O_PATH);
   if (dir_fd < 0 || fstat (dir_fd, real_dir_st_buf) != 0)
     goto errout;
+
+  if (real_dir_handle_out)
+    *real_dir_handle_out = xdp_file_handle_for_fd (dir_fd);
 
   if (name != NULL)
     {
@@ -490,7 +608,7 @@ portal_add (GDBusMethodInvocation *invocation,
   DocumentAddFullFlags flags = 0;
   GDBusMessage *message;
   GUnixFDList *fd_list;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
   g_auto(GStrv) ids = NULL;
 
   g_variant_get (parameters, "(hbb)", &fd_id, &reuse_existing, &persistent);
@@ -517,7 +635,7 @@ portal_add (GDBusMethodInvocation *invocation,
 
   if (ids == NULL)
     {
-      g_dbus_method_invocation_take_error (invocation, error);
+      g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
       return;
     }
 
@@ -549,18 +667,18 @@ metadata_check_file_access (const char *keyfile_path,
         {
           const char *fs = fss[i];
 
-          if (strcmp (fs, "!host") == 0)
+          if (g_strcmp0 (fs, "!host") == 0)
             *allow_host_out = 0;
-          if (strcmp (fs, "host:ro") == 0)
+          if (g_strcmp0 (fs, "host:ro") == 0)
             *allow_host_out = 1;
-          if (strcmp (fs, "host") == 0)
+          if (g_strcmp0 (fs, "host") == 0)
             *allow_host_out = 2;
 
-          if (strcmp (fs, "!home") == 0)
+          if (g_strcmp0 (fs, "!home") == 0)
             *allow_home_out = 0;
-          if (strcmp (fs, "home:ro") == 0)
+          if (g_strcmp0 (fs, "home:ro") == 0)
             *allow_home_out = 1;
-          if (strcmp (fs, "home") == 0)
+          if (g_strcmp0 (fs, "home") == 0)
             *allow_home_out = 2;
         }
     }
@@ -635,7 +753,7 @@ app_has_file_access (const char *target_app_id,
   g_autofree char *res = NULL;
   g_autofree char *arg = NULL;
 
-  if (target_app_id == NULL || target_app_id[0] == '\0')
+  if (target_app_id == NULL || !xdp_is_valid_app_id (target_app_id))
     return FALSE;
 
   if (g_str_has_prefix (target_app_id, "snap."))
@@ -650,14 +768,14 @@ app_has_file_access (const char *target_app_id,
       res = xdp_spawn (&error, "flatpak", "info", arg, target_app_id, NULL);
     }
 
-  g_strchomp (res);
-
   if (res)
     {
-      if (strcmp (res, "read-write") == 0)
+      g_strchomp (res);
+
+      if (g_strcmp0 (res, "read-write") == 0)
         return TRUE;
 
-      if (strcmp (res, "read-only") == 0 &&
+      if (g_strcmp0 (res, "read-only") == 0 &&
           ((target_perms & DOCUMENT_PERMISSION_FLAGS_WRITE) == 0))
         return TRUE;
 
@@ -685,7 +803,7 @@ portal_add_full (GDBusMethodInvocation *invocation,
   g_autofree int *fd = NULL;
   g_autofree DocumentAddFullFlags *documents_flags = NULL;
   g_auto(GStrv) ids = NULL;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
   GVariantBuilder builder;
   int fds_len;
   int i;
@@ -693,6 +811,15 @@ portal_add_full (GDBusMethodInvocation *invocation,
 
   g_variant_get (parameters, "(@ahu&s^a&s)",
                  &array, &flags, &target_app_id, &permissions);
+
+  if (target_app_id[0] != '\0' &&
+      !xdp_is_valid_app_id (target_app_id))
+    {
+      g_dbus_method_invocation_return_error (invocation,
+                                             XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                                             "'%s' is not a valid app name", target_app_id);
+      return;
+    }
 
   if ((flags & ~DOCUMENT_ADD_FLAGS_FLAGS_ALL) != 0)
     {
@@ -705,7 +832,7 @@ portal_add_full (GDBusMethodInvocation *invocation,
   target_perms = xdp_parse_permissions (permissions, &error);
   if (error)
     {
-      g_dbus_method_invocation_take_error (invocation, error);
+      g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
       return;
     }
 
@@ -740,7 +867,7 @@ portal_add_full (GDBusMethodInvocation *invocation,
 
   if (ids == NULL)
     {
-      g_dbus_method_invocation_take_error (invocation, error);
+      g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
       return;
     }
 
@@ -773,6 +900,7 @@ document_add_full (int                      *fd,
   const char *app_id = xdp_app_info_get_id (app_info);
   g_autoptr(GPtrArray) ids = g_ptr_array_new_with_free_func (g_free);
   g_autoptr(GPtrArray) paths = g_ptr_array_new_with_free_func (g_free);
+  g_autoptr(GPtrArray) handles = g_ptr_array_new_with_free_func ((GDestroyNotify) g_bytes_unref);
   g_autofree struct stat *real_dir_st_bufs = NULL;
   struct stat st_buf;
   g_autofree gboolean *writable = NULL;
@@ -780,6 +908,7 @@ document_add_full (int                      *fd,
 
   g_ptr_array_set_size (paths, n_args + 1);
   g_ptr_array_set_size (ids, n_args + 1);
+  g_ptr_array_set_size (handles, n_args + 1);
   real_dir_st_bufs = g_new0 (struct stat, n_args);
   writable = g_new0 (gboolean, n_args);
 
@@ -794,7 +923,11 @@ document_add_full (int                      *fd,
       is_dir = (flags & DOCUMENT_ADD_FLAGS_DIRECTORY) != 0;
       allow_write = (target_perms & DOCUMENT_PERMISSION_FLAGS_WRITE) != 0;
 
-      if (!validate_fd (fd[i], app_info, is_dir ? VALIDATE_FD_FILE_TYPE_DIR : VALIDATE_FD_FILE_TYPE_REGULAR, &st_buf, &real_dir_st_bufs[i], &path, &writable[i], error))
+      if (!validate_fd (fd[i], app_info,
+                        is_dir ? VALIDATE_FD_FILE_TYPE_DIR : VALIDATE_FD_FILE_TYPE_REGULAR,
+                        &st_buf, &real_dir_st_bufs[i],
+                        (GBytes **)&g_ptr_array_index (handles, i),
+                        &path, &writable[i], error))
         return NULL;
 
       if (parent_dev != NULL && parent_ino != NULL)
@@ -836,6 +969,8 @@ document_add_full (int                      *fd,
           if (real_path)
             {
               g_autofree char *dirname = NULL;
+              g_autofd int dir_fd = -1;
+              g_autoptr(GBytes) old_handle = NULL;
 
               g_free (path);
               path = g_steal_pointer (&real_path);
@@ -844,13 +979,18 @@ document_add_full (int                      *fd,
                 dirname = g_strdup (path);
               else
                 dirname = g_path_get_dirname (path);
-              if (lstat (dirname, &real_dir_st_bufs[i]) != 0)
+
+              dir_fd = open (dirname, O_CLOEXEC | O_PATH);
+              if (dir_fd < 0 || fstat (dir_fd, &real_dir_st_bufs[i]) != 0)
                 {
                   g_set_error (error,
                                XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                "Invalid fd passed");
                   return NULL;
                 }
+
+              old_handle = g_steal_pointer (&g_ptr_array_index (handles, i));
+              g_ptr_array_index (handles, i) = xdp_file_handle_for_fd (dir_fd);
             }
           else
             g_ptr_array_index(ids,i) = g_steal_pointer (&id);
@@ -893,10 +1033,10 @@ document_add_full (int                      *fd,
 
         if (g_ptr_array_index(ids,i) == NULL)
           {
-            char *id = do_create_doc (&real_dir_st_bufs[i], path, reuse_existing, persistent, is_dir);
+            char *id = do_create_doc (&real_dir_st_bufs[i], g_ptr_array_index (handles, i), path, reuse_existing, persistent, is_dir);
             g_ptr_array_index(ids,i) = id;
 
-            if (app_id[0] != '\0' && strcmp (app_id, target_app_id) != 0)
+            if (app_id[0] != '\0' && g_strcmp0 (app_id, target_app_id) != 0)
               {
                 DocumentPermissionFlags caller_perms = caller_base_perms;
 
@@ -949,6 +1089,7 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
   g_autofree char *parent_path = NULL;
   const int *fds = NULL;
   struct stat parent_st_buf;
+  g_autoptr(GBytes) handle = NULL;
   gboolean reuse_existing, persistent, as_needed_by_app;
   guint32 flags = 0;
   const char *filename;
@@ -959,7 +1100,7 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
   DocumentPermissionFlags target_perms;
   GVariantBuilder builder;
   g_autoptr(GVariant) filename_v = NULL;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
 
   g_variant_get (parameters, "(h@ayus^a&s)", &parent_fd_id, &filename_v, &flags, &target_app_id, &permissions);
   filename = g_variant_get_bytestring (filename_v);
@@ -970,6 +1111,15 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_NOT_ALLOWED,
                                              "Not enough permissions");
+      return;
+    }
+
+  if (target_app_id[0] != '\0' &&
+      !xdp_is_valid_app_id (target_app_id))
+    {
+      g_dbus_method_invocation_return_error (invocation,
+                                             XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                                             "'%s' is not a valid app name", target_app_id);
       return;
     }
 
@@ -990,7 +1140,7 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
   target_perms = xdp_parse_permissions (permissions, &error);
   if (error)
     {
-      g_dbus_method_invocation_take_error (invocation, error);
+      g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
       return;
     }
 
@@ -1005,7 +1155,7 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
         parent_fd = fds[parent_fd_id];
     }
 
-  if (strchr (filename, '/') != NULL || *filename == 0)
+  if (!xdp_is_valid_filename (filename))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
@@ -1022,13 +1172,13 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
         g_debug ("Invalid fd passed: \"%s\" not on FUSE device", parent_path);
 
       /* Don't leak any info about real file path existence, etc */
-      g_clear_error (&error);
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
                                              "Invalid fd passed");
       return;
     }
 
+  handle = xdp_file_handle_for_fd (parent_fd);
   path = g_build_filename (parent_path, filename, NULL);
 
   g_debug ("portal_add_named_full %s", path);
@@ -1053,9 +1203,9 @@ portal_add_named_full (GDBusMethodInvocation *invocation,
       }
     else
       {
-        id = do_create_doc (&parent_st_buf, path, reuse_existing, persistent, FALSE);
+        id = do_create_doc (&parent_st_buf, handle, path, reuse_existing, persistent, FALSE);
 
-        if (app_id[0] != '\0' && strcmp (app_id, target_app_id) != 0)
+        if (app_id[0] != '\0' && g_strcmp0 (app_id, target_app_id) != 0)
           {
             g_autoptr(PermissionDbEntry) entry = permission_db_lookup (db, id);;
             do_set_permissions (entry, id, app_id, caller_perms);
@@ -1104,6 +1254,7 @@ portal_add_named (GDBusMethodInvocation *invocation,
   g_autofree char *parent_path = NULL;
   g_autofree char *path = NULL;
   struct stat parent_st_buf;
+  g_autoptr(GBytes) handle = NULL;
   const char *filename;
   gboolean reuse_existing, persistent;
   g_autoptr(GError) local_error = NULL;
@@ -1132,7 +1283,7 @@ portal_add_named (GDBusMethodInvocation *invocation,
         parent_fd = fds[parent_fd_id];
     }
 
-  if (strchr (filename, '/') != NULL || *filename == 0)
+  if (!xdp_is_valid_filename (filename))
     {
       g_dbus_method_invocation_return_error (invocation,
                                              XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
@@ -1156,11 +1307,12 @@ portal_add_named (GDBusMethodInvocation *invocation,
       return;
     }
 
+  handle = xdp_file_handle_for_fd (parent_fd);
   path = g_build_filename (parent_path, filename, NULL);
 
   XDP_AUTOLOCK (db);
 
-  id = do_create_doc (&parent_st_buf, path, reuse_existing, persistent, FALSE);
+  id = do_create_doc (&parent_st_buf, handle, path, reuse_existing, persistent, FALSE);
 
   g_dbus_method_invocation_return_value (invocation,
                                          g_variant_new ("(s)", id));
@@ -1178,7 +1330,10 @@ handle_method (GCallback              method_callback,
   g_autoptr(XdpAppInfo) app_info = NULL;
   PortalMethod portal_method = (PortalMethod)method_callback;
 
-  app_info = xdp_invocation_ensure_app_info_sync (invocation, NULL, &error);
+  app_info = xdp_app_info_registry_ensure_for_invocation_sync (app_info_registry,
+                                                               invocation,
+                                                               NULL,
+                                                               &error);
   if (app_info == NULL)
     g_dbus_method_invocation_return_gerror (invocation, error);
   else
@@ -1211,8 +1366,9 @@ portal_lookup (GDBusMethodInvocation *invocation,
   g_autofree char *path = NULL;
   g_autofd int fd = -1;
   struct stat st_buf, real_dir_st_buf;
+  g_autoptr(GBytes) handle = NULL;
   g_autofree char *id = NULL;
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
   gboolean is_dir;
 
   if (!xdp_app_info_is_host (app_info))
@@ -1235,9 +1391,9 @@ portal_lookup (GDBusMethodInvocation *invocation,
       return TRUE;
     }
 
-  if (!validate_fd (fd, app_info, VALIDATE_FD_FILE_TYPE_ANY, &st_buf, &real_dir_st_buf, &path, NULL, &error))
+  if (!validate_fd (fd, app_info, VALIDATE_FD_FILE_TYPE_ANY, &st_buf, &real_dir_st_buf, &handle, &path, NULL, &error))
     {
-      g_dbus_method_invocation_take_error (invocation, error);
+      g_dbus_method_invocation_take_error (invocation, g_steal_pointer (&error));
       return TRUE;
     }
 
@@ -1251,35 +1407,12 @@ portal_lookup (GDBusMethodInvocation *invocation,
     }
   else
     {
-      g_autoptr(GVariant) data = NULL;
-      g_autoptr(GVariant) data_transient = NULL;
-      g_auto(GStrv) ids = NULL;
-      guint32 flags = 0;
-
-      if (is_dir)
-        flags |= DOCUMENT_ENTRY_FLAG_DIRECTORY;
-
-      data = g_variant_ref_sink (g_variant_new ("(^ayttu)",
-                                                path,
-                                                (guint64)real_dir_st_buf.st_dev,
-                                                (guint64)real_dir_st_buf.st_ino,
-                                                flags));
-      ids = permission_db_list_ids_by_value (db, data);
-      if (ids[0] != NULL)
-        id = g_strdup (ids[0]);
-
-      if (id == NULL)
-        {
-          g_auto(GStrv) transient_ids = NULL;
-          data_transient = g_variant_ref_sink (g_variant_new ("(^ayttu)",
-                                                              path,
-                                                              (guint64)real_dir_st_buf.st_dev,
-                                                              (guint64)real_dir_st_buf.st_ino,
-                                                              flags|DOCUMENT_ENTRY_FLAG_TRANSIENT));
-          transient_ids = permission_db_list_ids_by_value (db, data_transient);
-          if (transient_ids[0] != NULL)
-            id = g_strdup (transient_ids[0]);
-        }
+      id = find_id (path,
+                    real_dir_st_buf.st_dev,
+                    real_dir_st_buf.st_ino,
+                    handle,
+                    is_dir ? DOCUMENT_ENTRY_FLAG_DIRECTORY : 0,
+                    TRUE /* ignore_transient */);
     }
 
   g_dbus_method_invocation_return_value (invocation,
@@ -1311,10 +1444,8 @@ get_app_permissions (PermissionDbEntry *entry)
 static GVariant *
 get_path (PermissionDbEntry *entry)
 {
-  g_autoptr (GVariant) data = permission_db_entry_get_data (entry);
-  const char *path;
+  const char *path = document_entry_get_path (entry);
 
-  g_variant_get (data, "(^&ayttu)", &path, NULL, NULL, NULL);
   return g_variant_new_bytestring (path);
 }
 
@@ -1378,7 +1509,7 @@ portal_list (GDBusMethodInvocation *invocation,
 
   XDP_AUTOLOCK (db);
 
-  if (strcmp (app_id, "") == 0)
+  if (g_strcmp0 (app_id, "") == 0)
     ids = permission_db_list_ids (db);
   else
     ids = permission_db_list_ids_by_app (db, app_id);
@@ -1496,9 +1627,11 @@ portal_get_host_paths (GDBusMethodInvocation *invocation,
 }
 
 static void
-peer_died_cb (const char *name)
+on_peer_disconnect (const char *name,
+                    gpointer    user_data)
 {
   stop_file_transfers_for_sender (name);
+  xdp_app_info_registry_delete (app_info_registry, name);
 }
 
 static void
@@ -1506,10 +1639,12 @@ on_bus_acquired (GDBusConnection *connection,
                  const gchar     *name,
                  gpointer         user_data)
 {
-  GError *error = NULL;
+  g_autoptr(GError) error = NULL;
   GDBusInterfaceSkeleton *file_transfer;
 
   dbus_api = xdp_dbus_documents_skeleton_new ();
+
+  app_info_registry = xdp_app_info_registry_new ();
 
   xdp_dbus_documents_set_version (XDP_DBUS_DOCUMENTS (dbus_api), 5);
 
@@ -1530,7 +1665,7 @@ on_bus_acquired (GDBusConnection *connection,
   g_dbus_interface_skeleton_set_flags (file_transfer,
                                        G_DBUS_INTERFACE_SKELETON_FLAGS_HANDLE_METHOD_INVOCATIONS_IN_THREAD);
 
-  xdp_connection_track_name_owners (connection, peer_died_cb);
+  xdp_connection_track_peer_disconnect (connection, on_peer_disconnect, NULL);
 
   if (!g_dbus_interface_skeleton_export (G_DBUS_INTERFACE_SKELETON (dbus_api),
                                          connection,
@@ -1538,7 +1673,7 @@ on_bus_acquired (GDBusConnection *connection,
                                          &error))
     {
       g_warning ("error: %s", error->message);
-      g_error_free (error);
+      g_clear_error (&error);
     }
 
   g_debug ("Providing portal %s", g_dbus_interface_skeleton_get_info (G_DBUS_INTERFACE_SKELETON (dbus_api))->name);
@@ -1549,7 +1684,7 @@ on_bus_acquired (GDBusConnection *connection,
                                          &error))
     {
       g_warning ("error: %s", error->message);
-      g_error_free (error);
+      g_clear_error (&error);
     }
 
   g_debug ("Providing portal %s", g_dbus_interface_skeleton_get_info (G_DBUS_INTERFACE_SKELETON (file_transfer))->name);
@@ -1628,13 +1763,12 @@ on_fuse_unmount (void *unused)
   return G_SOURCE_REMOVE;
 }
 
-static void
-exit_handler (int sig)
+static gboolean
+exit_handler (gpointer user_data)
 {
-  /* We cannot set exit_error here, because malloc() in a signal handler
-   * is undefined behaviour. Rely on main() coping gracefully with
-   * that. */
   g_main_loop_quit (loop);
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
@@ -1646,35 +1780,6 @@ session_bus_closed (GDBusConnection *connection,
     g_set_error (&exit_error, G_IO_ERROR, G_IO_ERROR_BROKEN_PIPE, "Disconnected from session bus");
 
   g_main_loop_quit (loop);
-}
-
-static int
-set_one_signal_handler (int    sig,
-                        void (*handler)(int),
-                        int    remove)
-{
-  struct sigaction sa;
-  struct sigaction old_sa;
-
-  memset (&sa, 0, sizeof (struct sigaction));
-  sa.sa_handler = remove ? SIG_DFL : handler;
-  sigemptyset (&(sa.sa_mask));
-  sa.sa_flags = 0;
-
-  if (sigaction (sig, NULL, &old_sa) == -1)
-    {
-      g_warning ("cannot get old signal handler");
-      return -1;
-    }
-
-  if (old_sa.sa_handler == (remove ? handler : SIG_DFL) &&
-      sigaction (sig, &sa, NULL) == -1)
-    {
-      g_warning ("cannot set signal handler");
-      return -1;
-    }
-
-  return 0;
 }
 
 static gboolean opt_verbose;
@@ -1723,8 +1828,9 @@ main (int    argc,
 
   g_autoptr(GError) error = NULL;
   g_autofree char *path = NULL;
-  GDBusConnection *session_bus;
+  g_autoptr(GDBusConnection) session_bus = NULL;
   g_autoptr(GOptionContext) context = NULL;
+  g_autoptr(PermissionDb) owned_db = NULL;
   GDBusMethodInvocation *invocation;
 
   if (g_getenv ("XDG_DOCUMENT_PORTAL_WAIT_FOR_DEBUGGER") != NULL)
@@ -1773,7 +1879,7 @@ main (int    argc,
   loop = g_main_loop_new (NULL, FALSE);
 
   path = g_build_filename (g_get_user_data_dir (), "flatpak/db", TABLE_NAME, NULL);
-  db = permission_db_new (path, FALSE, &error);
+  db = owned_db = permission_db_new (path, FALSE, &error);
   if (db == NULL)
     {
       g_printerr ("Failed to load db from '%s': %s", path, error->message);
@@ -1802,10 +1908,10 @@ main (int    argc,
 
   g_signal_connect (session_bus, "closed", G_CALLBACK (session_bus_closed), NULL);
 
-  if (set_one_signal_handler (SIGHUP, exit_handler, 0) == -1 ||
-      set_one_signal_handler (SIGINT, exit_handler, 0) == -1 ||
-      set_one_signal_handler (SIGTERM, exit_handler, 0) == -1 ||
-      set_one_signal_handler (SIGPIPE, SIG_IGN, 0) == -1)
+  if (g_unix_signal_add (SIGHUP, exit_handler, NULL) == 0 ||
+      g_unix_signal_add (SIGINT, exit_handler, NULL) == 0 ||
+      g_unix_signal_add (SIGTERM, exit_handler, NULL) == 0 ||
+      signal (SIGPIPE, SIG_IGN) == SIG_ERR)
     exit (5);
 
   owner_id = g_bus_own_name (G_BUS_TYPE_SESSION,

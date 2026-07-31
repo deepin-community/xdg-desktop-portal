@@ -24,29 +24,33 @@
 
 #include "config.h"
 
+#include "file-transfer.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 
-#include "file-transfer.h"
+#include "document-enums.h"
+#include "document-portal-dbus.h"
+#include "document-portal-fuse.h"
+#include "document-portal.h"
+#include "src/xdp-app-info-registry.h"
 #include "src/xdp-app-info.h"
 #include "src/xdp-utils.h"
-#include "document-portal-dbus.h"
-#include "document-enums.h"
-#include "document-portal.h"
-#include "document-portal-fuse.h"
 
 static XdpDbusFileTransfer *file_transfer;
+
+extern XdpAppInfoRegistry *app_info_registry;
 
 typedef struct
 {
@@ -67,9 +71,9 @@ exported_file_free (gpointer data)
 
 typedef struct
 {
-  GObject object;
-  GMutex mutex;
+  GObject parent;
 
+  GMutex mutex;
   GPtrArray *files;
   gboolean writable;
   gboolean autostop;
@@ -85,7 +89,7 @@ typedef struct
 
 static GType file_transfer_get_type (void);
 
-G_DEFINE_TYPE (FileTransfer, file_transfer, G_TYPE_OBJECT)
+G_DEFINE_TYPE (FileTransfer, file_transfer, G_TYPE_OBJECT);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC (FileTransfer, g_object_unref);
 
@@ -148,20 +152,23 @@ lookup_transfer (const char *key)
 
   G_LOCK (transfers);
   transfer = (FileTransfer *)g_hash_table_lookup (transfers, key);
-  if (transfer)
-    g_object_ref (transfer);
   G_UNLOCK (transfers);
 
-  return transfer;
+  if (!transfer)
+    return NULL;
+
+  return g_object_ref (transfer);
 }
 
+
 static FileTransfer *
-file_transfer_start (XdpAppInfo *app_info,
-                     const char *sender,
-                     gboolean    writable,
-                     gboolean    autostop)
+file_transfer_start (XdpAppInfo  *app_info,
+                     const char  *sender,
+                     gboolean     writable,
+                     gboolean     autostop,
+                     GError     **error)
 {
-  FileTransfer *transfer;
+  g_autoptr(FileTransfer) transfer = NULL;
 
   transfer = g_object_new (file_transfer_get_type (), NULL);
 
@@ -171,15 +178,11 @@ file_transfer_start (XdpAppInfo *app_info,
   transfer->autostop = autostop;
   transfer->files = g_ptr_array_new_with_free_func (exported_file_free);
 
+  transfer->key = xdp_generate_key (error);
+  if (!transfer->key)
+    return NULL;
+
   G_LOCK (transfers);
-  do {
-    guint64 key;
-    g_free (transfer->key);
-    key = g_random_int ();
-    key = (key << 32) | g_random_int ();
-    transfer->key = g_strdup_printf ("%" G_GUINT64_FORMAT, key);
-  }
-  while (g_hash_table_contains (transfers, transfer->key));
   g_hash_table_insert (transfers, transfer->key, g_object_ref (transfer));
   G_UNLOCK (transfers);
 
@@ -187,17 +190,7 @@ file_transfer_start (XdpAppInfo *app_info,
            xdp_app_info_get_id (transfer->app_info),
            transfer->sender);
 
-  return transfer;
-}
-
-static gboolean
-stop (gpointer data)
-{
-  FileTransfer *transfer = data;
-
-  g_object_unref (transfer);
-
-  return G_SOURCE_REMOVE;
+  return g_steal_pointer (&transfer);
 }
 
 static void
@@ -222,14 +215,15 @@ file_transfer_stop (FileTransfer *transfer)
   g_hash_table_steal (transfers, transfer->key);
   G_UNLOCK (transfers);
 
-  g_idle_add (stop, transfer);
+  /* goblint-ignore-next-line: g_source_id_not_stored */
+  g_idle_add_once (g_object_unref, g_steal_pointer (&transfer));
 }
 
 static void
 file_transfer_add_file (FileTransfer *transfer,
-                        const char *path,
-                        struct stat *st_buf,
-                        struct stat *parent_st_buf)
+                        const char   *path,
+                        struct stat  *st_buf,
+                        struct stat  *parent_st_buf)
 {
   ExportedFile *file;
 
@@ -243,9 +237,9 @@ file_transfer_add_file (FileTransfer *transfer,
 }
 
 static char **
-file_transfer_execute (FileTransfer *transfer,
-                       XdpAppInfo *target_app_info,
-                       GError **error)
+file_transfer_execute (FileTransfer  *transfer,
+                       XdpAppInfo    *target_app_info,
+                       GError       **error)
 {
   DocumentAddFullFlags common_flags;
   DocumentPermissionFlags perms;
@@ -338,11 +332,12 @@ file_transfer_execute (FileTransfer *transfer,
 
 static void
 start_transfer (GDBusMethodInvocation *invocation,
-                GVariant *parameters,
-                XdpAppInfo *app_info)
+                GVariant              *parameters,
+                XdpAppInfo            *app_info)
 {
   g_autoptr(GVariant) options = NULL;
   g_autoptr(FileTransfer) transfer = NULL;
+  g_autoptr(GError) error = NULL;
   gboolean writable;
   gboolean autostop;
   const char *sender;
@@ -356,15 +351,20 @@ start_transfer (GDBusMethodInvocation *invocation,
 
   sender = g_dbus_method_invocation_get_sender (invocation);
 
-  transfer = file_transfer_start (app_info, sender, writable, autostop);
+  transfer = file_transfer_start (app_info, sender, writable, autostop, &error);
+  if (!transfer)
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return;
+    }
 
   g_dbus_method_invocation_return_value (invocation, g_variant_new ("(s)", transfer->key));
 }
 
 static void
 add_files (GDBusMethodInvocation *invocation,
-           GVariant *parameters,
-           XdpAppInfo *app_info)
+           GVariant              *parameters,
+           XdpAppInfo            *app_info)
 {
   FileTransfer *transfer;
   const char *key;
@@ -390,7 +390,7 @@ add_files (GDBusMethodInvocation *invocation,
 
   TRANSFER_AUTOLOCK_UNREF (transfer);
 
-  if (strcmp (transfer->sender, g_dbus_method_invocation_get_sender (invocation)) != 0)
+  if (g_strcmp0 (transfer->sender, g_dbus_method_invocation_get_sender (invocation)) != 0)
     {
       g_dbus_method_invocation_return_error (invocation,
                                              G_DBUS_ERROR,
@@ -437,7 +437,7 @@ add_files (GDBusMethodInvocation *invocation,
           return;
         }
 
-      if (!validate_fd (fd, app_info, VALIDATE_FD_FILE_TYPE_ANY, &st_buf, &parent_st_buf, &path, &fd_is_writable, NULL) ||
+      if (!validate_fd (fd, app_info, VALIDATE_FD_FILE_TYPE_ANY, &st_buf, &parent_st_buf, NULL, &path, &fd_is_writable, NULL) ||
           (transfer->writable && !fd_is_writable))
         {
           g_dbus_method_invocation_return_error (invocation,
@@ -456,8 +456,8 @@ add_files (GDBusMethodInvocation *invocation,
 
 static void
 retrieve_files (GDBusMethodInvocation *invocation,
-                GVariant *parameters,
-                XdpAppInfo *app_info)
+                GVariant              *parameters,
+                XdpAppInfo            *app_info)
 {
   const char *key;
   FileTransfer *transfer;
@@ -490,8 +490,8 @@ retrieve_files (GDBusMethodInvocation *invocation,
 
 static void
 stop_transfer (GDBusMethodInvocation *invocation,
-                GVariant *parameters,
-                XdpAppInfo *app_info)
+               GVariant              *parameters,
+               XdpAppInfo            *app_info)
 {
   const char *key;
   FileTransfer *transfer;
@@ -527,7 +527,10 @@ handle_method (GCallback              method_callback,
   g_autoptr(XdpAppInfo) app_info = NULL;
   PortalMethod portal_method = (PortalMethod)method_callback;
 
-  app_info = xdp_invocation_ensure_app_info_sync (invocation, NULL, &error);
+  app_info = xdp_app_info_registry_ensure_for_invocation_sync (app_info_registry,
+                                                               invocation,
+                                                               NULL,
+                                                               &error);
   if (app_info == NULL)
     g_dbus_method_invocation_return_gerror (invocation, error);
   else
@@ -553,7 +556,7 @@ file_transfer_create (void)
   return G_DBUS_INTERFACE_SKELETON (file_transfer);
 }
 
-void
+static void
 stop_file_transfers_in_thread_func (GTask        *task,
                                     gpointer      source_object,
                                     gpointer      task_data,
@@ -569,7 +572,7 @@ stop_file_transfers_in_thread_func (GTask        *task,
       g_hash_table_iter_init (&iter, transfers);
       while (g_hash_table_iter_next (&iter, NULL, (gpointer *)&transfer))
         {
-          if (strcmp (sender, transfer->sender) == 0)
+          if (g_strcmp0 (sender, transfer->sender) == 0)
             {
               g_print ("removing transfer %s for dead peer %s\n", transfer->key, transfer->sender);
               g_hash_table_iter_remove (&iter);
@@ -583,10 +586,10 @@ stop_file_transfers_in_thread_func (GTask        *task,
 void
 stop_file_transfers_for_sender (const char *sender)
 {
-  GTask *task;
+  g_autoptr(GTask) task = NULL;
 
   task = g_task_new (NULL, NULL, NULL, NULL);
+  g_task_set_source_tag (task, stop_file_transfers_for_sender);
   g_task_set_task_data (task, g_strdup (sender), g_free);
   g_task_run_in_thread (task, stop_file_transfers_in_thread_func);
-  g_object_unref (task);
 }

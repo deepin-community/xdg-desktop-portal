@@ -20,12 +20,13 @@
 
 #include "config.h"
 
-#include <errno.h>
-#include <glib.h>
-#include <pipewire/pipewire.h>
-#include <spa/utils/result.h>
-
 #include "pipewire.h"
+#include <pipewire/pipewire.h>
+
+#include <errno.h>
+
+#include <glib.h>
+#include <spa/utils/result.h>
 
 #define ROUNDTRIP_TIMEOUT_SECS 10
 
@@ -59,14 +60,14 @@ registry_event_global (void *user_data,
   if (remote->global_added_cb)
     remote->global_added_cb (remote, id, type, props, remote->user_data);
 
-  if (strcmp(type, PW_TYPE_INTERFACE_Factory) != 0)
+  if (g_strcmp0(type, PW_TYPE_INTERFACE_Factory) != 0)
     return;
 
   factory_object_type = spa_dict_lookup_item (props, "factory.type.name");
   if (!factory_object_type)
     return;
 
-  if (strcmp (factory_object_type->value, "PipeWire:Interface:ClientNode") == 0)
+  if (g_strcmp0 (factory_object_type->value, "PipeWire:Interface:ClientNode") == 0)
     {
       remote->node_factory_id = id;
       pw_main_loop_quit (remote->loop);
@@ -224,7 +225,7 @@ pipewire_remote_destroy (PipeWireRemote *remote)
   /* This check is a workaround for older PW versions */
   if (remote->registry)
     spa_hook_remove (&remote->registry_listener);
-  g_clear_pointer (&remote->registry, pw_proxy_destroy);
+  g_clear_pointer ((struct pw_proxy **)&remote->registry, pw_proxy_destroy);
   g_clear_pointer (&remote->globals, g_hash_table_destroy);
   if (remote->core)
     spa_hook_remove (&remote->core_listener);
@@ -298,7 +299,9 @@ pipewire_remote_new_sync (struct pw_properties *pipewire_properties,
       return NULL;
     }
 
-  remote->context = pw_context_new (pw_main_loop_get_loop (remote->loop), NULL, 0);
+  /* Loading module-rt will invoke the Realtime portal, causing a potential hang */
+  remote->context = pw_context_new (pw_main_loop_get_loop (remote->loop),
+      pw_properties_new ("module.rt", "false", NULL), 0);
   if (!remote->context)
     {
       pipewire_remote_destroy (remote);
@@ -328,10 +331,10 @@ pipewire_remote_new_sync (struct pw_properties *pipewire_properties,
                         &core_events,
                         remote);
 
-  remote->registry = (struct pw_proxy*) pw_core_get_registry (remote->core,
-                                                              PW_VERSION_REGISTRY,
-                                                              0);
-  pw_registry_add_listener ((struct pw_registry*)remote->registry,
+  remote->registry = pw_core_get_registry (remote->core,
+                                           PW_VERSION_REGISTRY,
+                                           0);
+  pw_registry_add_listener (remote->registry,
                             &remote->registry_listener,
                             &registry_events,
                             remote);

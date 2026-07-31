@@ -1,8 +1,9 @@
 #pragma once
 
 #include <gio/gio.h>
-#include "permission-db.h"
+
 #include "document-enums.h"
+#include "permission-db.h"
 #include "src/xdp-app-info.h"
 #include "src/xdp-utils.h"
 
@@ -32,8 +33,13 @@ char *             document_entry_dup_dirname (PermissionDbEntry *entry);
 guint64            document_entry_get_device (PermissionDbEntry *entry);
 guint64            document_entry_get_inode (PermissionDbEntry *entry);
 guint32            document_entry_get_flags (PermissionDbEntry *entry);
+GBytes *           document_entry_dup_handle (PermissionDbEntry *entry);
 
-char *  xdp_name_from_id (guint32 doc_id);
+PermissionDbEntry *document_entry_new (const char *path,
+                                       guint32     flags,
+                                       dev_t       st_dev,
+                                       ino_t       st_ino,
+                                       GBytes     *handle);
 
 
 G_END_DECLS

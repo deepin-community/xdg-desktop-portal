@@ -66,14 +66,15 @@ xdp_method_info_sources = files('xdp-method-info.c') + xdp_method_info_built_sou
 xdp_utils_deps = []
 xdp_utils_includes = include_directories('.')
 xdp_utils_sources = enums_sources + files(
-  'xdp-utils.c',
   'xdp-app-info.c',
-  'xdp-sealed-fd.c',
-  'xdp-app-info-host.c',
   'xdp-app-info-flatpak.c',
+  'xdp-app-info-host.c',
+  'xdp-app-info-registry.c',
   'xdp-app-info-snap.c',
-  'xdp-app-info-test.c',
+  'xdp-app-info-linyaps.c',
+  'xdp-sealed-fd.c',
   'xdp-usb-query.c',
+  'xdp-utils.c',
 )
 
 if have_libsystemd
@@ -111,13 +112,13 @@ xdg_desktop_portal_sources = files(
   'settings.c',
   'trash.c',
   'wallpaper.c',
-  'xdg-desktop-portal.c',
   'xdp-app-launch-context.c',
   'xdp-background-monitor.c',
-  'xdp-call.c',
+  'xdp-context.c',
   'xdp-documents.c',
+  'xdp-main.c',
   'xdp-permissions.c',
-  'xdp-portal-impl.c',
+  'xdp-portal-config.c',
   'xdp-request.c',
   'xdp-session.c',
   'xdp-session-persistence.c',
