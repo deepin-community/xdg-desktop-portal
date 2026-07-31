@@ -20,9 +20,10 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include <gio/gio.h>
 #include <pipewire/pipewire.h>
-#include <stdint.h>
 
 typedef struct _PipeWireRemote PipeWireRemote;
 
@@ -53,7 +54,7 @@ struct _PipeWireRemote
 
   int sync_seq;
 
-  struct pw_proxy *registry;
+  struct pw_registry *registry;
   struct spa_hook registry_listener;
 
   GHashTable *globals;

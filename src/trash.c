@@ -19,25 +19,25 @@
 
 #include "config.h"
 
+#include "trash.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
-
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
 
 #include <gio/gio.h>
-#include <gio/gunixmounts.h>
 #include <gio/gunixfdlist.h>
+#include <gio/gunixmounts.h>
 #include <libglnx.h>
 
-#include "trash.h"
-#include "xdp-call.h"
-#include "xdp-documents.h"
 #include "xdp-app-info.h"
+#include "xdp-context.h"
 #include "xdp-dbus.h"
+#include "xdp-documents.h"
 #include "xdp-impl-dbus.h"
 #include "xdp-utils.h"
 
@@ -54,14 +54,14 @@ struct _TrashClass
   XdpDbusTrashSkeletonClass parent_class;
 };
 
-static Trash *trash;
-
 GType trash_get_type (void) G_GNUC_CONST;
 static void trash_iface_init (XdpDbusTrashIface *iface);
 
 G_DEFINE_TYPE_WITH_CODE (Trash, trash, XDP_DBUS_TYPE_TRASH_SKELETON,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_TRASH,
                                                 trash_iface_init));
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (Trash, g_object_unref)
 
 /* Check whether subsequently deleting the original file from the trash
  * (in the gvfsd-trash process) will succeed. If we think it won’t, return
@@ -186,14 +186,26 @@ ignore_trash_mount_fd (XdpAppInfo *app_info,
         return FALSE;
 
       if (strstr (mount_options, "x-gvfs-notrash") != NULL)
-        return TRUE;
+        {
+          g_debug ("Ignoring the trash dir, because mount options include x-gvfs-notrash");
+          return TRUE;
+        }
     }
 
+  {
+    gboolean is_internal;
+
 #if GLIB_CHECK_VERSION(2,84,0)
-  return g_unix_mount_entry_is_system_internal (mount);
+    is_internal = g_unix_mount_entry_is_system_internal (mount);
 #else
-  return g_unix_mount_is_system_internal (mount);
+    is_internal = g_unix_mount_is_system_internal (mount);
 #endif
+
+    if (is_internal)
+      g_debug ("Ignoring the trash dir, because mount is internal");
+
+    return is_internal;
+  }
 }
 
 
@@ -460,16 +472,16 @@ get_trash_dir (XdpAppInfo  *app_info,
   if (!get_mnt (target_fd, parent_fd, &mnt_fd, &mnt_id, error))
     return FALSE;
 
+  /* First choice is always the home trash. */
+  if (get_trash_dir_home (mnt_id, trash_fd_out, &local_error))
+    return TRUE;
+
   if (ignore_trash_mount_fd (app_info, mnt_fd))
     {
       g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVAL,
                            "No suitable trash directory found");
       return FALSE;
     }
-
-  /* First choice is always the home trash. */
-  if (get_trash_dir_home (mnt_id, trash_fd_out, &local_error))
-    return TRUE;
 
   g_debug ("Skipping home dir trash: %s", local_error->message);
   g_clear_error (&local_error);
@@ -561,19 +573,67 @@ open_parent (int          fd,
 }
 
 static gboolean
-trash_file (int          target_fd,
+trash_file (int          target_fd_in,
             XdpAppInfo  *app_info,
             GError     **error)
 {
+  g_autofd int target_fd = -1;
   g_autofree char *target_path = NULL;
+  gboolean writable;
   g_autofd int parent_fd = -1;
   g_autofd int trash_fd = -1;
   g_autofree char *restore_path = NULL;
   g_autofree char *restore_data = NULL;
 
-  target_path = xdp_app_info_get_path_for_fd (app_info, target_fd, 0, NULL, NULL, error);
+  target_path = xdp_app_info_get_path_for_fd (app_info,
+                                              target_fd_in,
+                                              0, NULL,
+                                              &writable,
+                                              error);
   if (!target_path)
     return FALSE;
+
+  g_debug ("Trying to trash file at '%s' on host", target_path);
+
+  if (!writable)
+    {
+      g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                           "File descriptor is not opened for writing");
+      return FALSE;
+    }
+
+  /* target_fd_in might be in the mount namespace of the caller and thus on a
+   * different mount than we expect in the host mount namespace. Let's reopen
+   * it and verify that we opened the right file. */
+  {
+    struct glnx_statx stx_in;
+    struct glnx_statx stx;
+
+    if (!glnx_statx (target_fd_in, "",
+                     AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                     GLNX_STATX_INO,
+                     &stx_in,
+                     error))
+      return FALSE;
+
+    target_fd = glnx_chase_and_statxat (AT_FDCWD, target_path,
+                                        GLNX_CHASE_NOFOLLOW,
+                                        GLNX_STATX_INO,
+                                        &stx,
+                                        error);
+    if (target_fd < 0)
+      return FALSE;
+
+    if (!(stx.stx_mask & GLNX_STATX_INO) || !(stx_in.stx_mask & GLNX_STATX_INO) ||
+        stx.stx_ino != stx_in.stx_ino ||
+        stx.stx_dev_major != stx_in.stx_dev_major ||
+        stx.stx_dev_minor != stx_in.stx_dev_minor)
+      {
+        g_set_error_literal (error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                             "Cannot determine path on the host");
+        return FALSE;
+      }
+  }
 
   parent_fd = open_parent (target_fd, target_path, error);
   if (parent_fd < 0)
@@ -751,27 +811,21 @@ handle_trash_file (XdpDbusTrash          *object,
                    GUnixFDList           *fd_list,
                    GVariant              *arg_fd)
 {
-  XdpCall *call = xdp_call_from_invocation (invocation);
-  int idx;
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
   g_autofd int fd = -1;
   guint result;
   g_autoptr(GError) error = NULL;
 
   g_debug ("Handling TrashFile");
 
-  g_variant_get (arg_fd, "h", &idx);
-  if (idx < 0 || idx >= g_unix_fd_list_get_length (fd_list))
+  fd = xdp_get_portal_call_fd (fd_list, g_variant_get_handle (arg_fd), &error);
+  if (fd < 0)
     {
-      g_dbus_method_invocation_return_error (invocation,
-                                             XDG_DESKTOP_PORTAL_ERROR,
-                                             XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
-                                             "Bad file descriptor index");
+      g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  fd = g_unix_fd_list_get (fd_list, idx, NULL);
-
-  if (!trash_file (fd, call->app_info, &error))
+  if (!trash_file (fd, app_info, &error))
     {
       g_debug ("Failed trashing file: %s", error->message);
       result = 0;
@@ -796,7 +850,6 @@ trash_iface_init (XdpDbusTrashIface *iface)
 static void
 trash_init (Trash *trash)
 {
-  xdp_dbus_trash_set_version (XDP_DBUS_TRASH (trash), 1);
 }
 
 static void
@@ -804,10 +857,15 @@ trash_class_init (TrashClass *klass)
 {
 }
 
-GDBusInterfaceSkeleton *
-trash_create (GDBusConnection *connection)
+void
+init_trash (XdpContext *context)
 {
-  trash = g_object_new (trash_get_type (), NULL);
+  g_autoptr(Trash) trash = NULL;
 
-  return G_DBUS_INTERFACE_SKELETON (trash);
+  trash = g_object_new (trash_get_type (), NULL);
+  xdp_dbus_trash_set_version (XDP_DBUS_TRASH (trash), 1);
+
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&trash)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }

@@ -1,26 +1,179 @@
-Changes in 1.20.4
+Changes in 1.22.1
+=================
+Released: 2026-06-17
+
+Security fixes:
+
+- Fix a security issue which allows a malicious sandboxed applications to
+  redirect drag-and-drop and copy-paste data to itself via a predictable
+  key in `FileTransfer.RetrieveFiles` (GHSA-c5cf-79w8-pvfh)
+- Fix a security issue which allows a malicious sandboxed applications to gain
+  arbitrary write access to nonexistent files outside of the sandbox via the
+  "files" option in `FileChooser.SaveFiles` (GHSA-cm83-2936-gxjm)
+- Validate all App IDs in the Document Portal to prevent malicious applications
+  from providing a well-crafted App ID which causes the parsing of arbitrary
+  files on the host as `Glib.KeyFile`s (#2023)
+
+Enhancements:
+
+- Disable PipeWire's realtime module to prevent deadlocks (#2012)
+
+Changes in 1.22.0
+=================
+Released: 2026-06-08
+
+Bug Fixes:
+
+- Correct passing icon GVariant around in the Dynamic Launcher Portal (#2006)
+- Improve Document Portal document path resolving for the File Chooser and
+  OpenURI Portals (#2004)
+
+Changes in 1.21.2
+=================
+Released: 2026-05-06
+
+New Features:
+
+- Add a target selection to the Screenshot Portal (#1981)
+- Add pipewire-serials to ScreenCast Portal streams (#1942)
+
+Enhancements:
+
+- Provide proper errors when enabling autostart failed (#1906)
+- Integration for the gobject-linter and respective fixes for rule violations
+  (#1974, #1996)
+- gvdb is now used as a meson subproject instead of a git subtree (#1978)
+- Add a missing deprecation annotation to `InputCapture.CreateSession` (#1967)
+- Various test and CI improvements (#1853, #1973, #1977)
+- Various code cleanups (#1969, #1958, #1979, #1960)
+- New and updated translations (#1965)
+
+Bug Fixes:
+
+- Improve how the document portal keeps track of granted documents to avoid
+  access getting lost when the system is rebooted (#1950)
+- Fix a regression which broke trashing files in Flatpak (#1982)
+- Improvements to the handling of the impl and frontend portal versions
+  (#1966, #1968, #1970)
+
+Changes in 1.21.1
 =================
 Released: 2026-04-08
 
-- Prevent trashing of arbitrary host files (GHSA-rqr9-jwwf-wxgj)
+New Features:
 
-Changes in 1.20.3
-=================
-Released: 2025-05-20
+- Add Clipboard support to the Input Capture Portal (#1803)
+- Add session persistence support to the Input Capture Portal (#1898, #1914,
+  #1913)
+
+Security fixes:
+
+- Prevent trashing of arbitrary host files (GHSA-rqr9-jwwf-wxgj)
+- Ensure that the clipboard mime type string does not exceed 4kb (#1918)
+- Increase the file transfer token key size (#1916)
+- Properly validate all D-Bus file descriptor indexes (#1917)
+
+Enhancements:
+
+- Improve loading portal configuration (#1867)
+- Drop unused `multiple` option in the File Chooser `SaveFile` request (#1923)
+- Clarify the `uris` option in the File Chooser `SaveFile` request (#1927)
+- Preparations for libdex support (#1879)
+- Improve documentation on the release procedure (#1887)
+- Specify that URIs follow RFC3986 (#1931)
+- Clarify `BindShortcuts` behavior in the Global Shortcuts portal (#1848)
+- Add a list of specialists for different portal topics (#1915)
+- Clarify that mime type filters in the File Chooser support wildcard subtypes
+  (#1850)
+- Continue removing global state and direct dependencies (#1911, #1934)
+- Add Stargate Kotlin library to list of convenience libraries (#1936)
+- Use the default FUSE implementation for statfs in the Document Portal (#1807)
+- Guard renameat2() flags usage behind ifdefs in the Document Portal (#1929)
+- Various testing improvements (#1909, #1891, #1890, #1907)
+- New and updated translations (#1904, #1912, #1892, #1910, #1935, #1949)
 
 Bug Fixes:
 
+- Fix the File Chooser Portal opening the parent of requested `current_folder`
+  (#1945)
+- Prevent a deadlock on Document Portal shutdown (#1896)
+- Various small fixes in the Remote Desktop, Camera, and Background Portals
+  (#1913, #1908, #1948, #1928, #1945)
+- Fix checking for Input Capture capabilities (#1895)
+- Print debug logs to stderr only, in the validate-icon and validate-sound utils
+  (#1901)
+
+Changes in 1.21.0
+=================
+Released: 2026-01-21
+
+New Features:
+
+- Add the `has_current_page` and `has_selected_pages` options to the Print
+  Portal (#1777)
+- Allow running the tests with Valgrind's memcheck (#1770)
+- Add the `ConfigureShortcuts` method to the Global Shortcuts Portal (#1661)
+- Send activation tokens in the actiavated and deactiavated signals on the
+  Global Shortcuts Portal (#1792)
+- Add a new reduced motion setting to the Settings Portal (#1840)
+- Support linyaps applications (#1846)
+- Add missing cell broadcast severities to the Notification Portal (#1738)
+
+Enhancements:
+
+- Code cleanup (#1574, #1809, #1771, #1727)
+- Code refactoring (#1805, #1815, #1819, #1686)
+- Documentation improvements (#1712, #1759, #1776, #1795, #1798, #1866)
+- New and updated translations (#1735, #1760, #1765, #1774, #1780, #1781,
+  #1786, #1787, #1789, #1797, #1800, #1801, #1802, #1811, #1833, #1826,
+  #1852, #1841, #1843, #1851, #1869, #1860, #1788)
+- Improve various permission dialog texts (#1769, #1327, #1804)
+- Release procedure clarifications (#1710, #1714)
+- Updates to ASAN suppressions (#1711)
+- Make XdpAppInfo more testable (#1627)
+- Use the new `PIDFD_GET_PID_NAMESPACE` ioctl to get the pidns (#1713)
+- Improvements to the heuristics to translate a path in the sandbox to a path on
+  the host (#1571)
+- Improve the mocking of the GeoClue service (#1695)
+- Make the camera permissions per-App on the host again (#1762)
+- Clean up permissions and desktop IDs usage (#1772, #1773)
+- Improve PID translations for host Apps (#1785)
+- Show an appropriate error when access to remote documents fails (#823)
+- Require a valid AppID from apps in `RequestBackground` to enable autostart
+  (#1793)
+- Require a valid AppID from apps to use the Global Shortcuts Portal (#1817)
+- Test and document Notification Portal backward compatibilities (#1823)
+- Improve the heuristic to detect the App ID for host apps (#1595)
+- Add Merge Requirements documentation (#1775)
+- Initialize the Secret Portal asynchronously to avoid blocking when the secret
+  service is not available (#1814)
+- Do not allow requesting a zero capability from the Input Capture Portal
+  (#1880)
+- Require GLib version 2.76 and drop the related compatibility code (#1730)
+
+Bug Fixes:
+
+- Fix a crash when loading information from Flatpak apps (#1720)
+- Fix fd handling to prevent EBADF errors (#1721)
 - Add a fallback code path for GLib older than 2.76 (#1728)
 - Don't require a .desktop file for Flatpak and Snap apps (#1729)
-
-Changes in 1.20.2
-=================
-Released: 2025-05-19
-
-Bug Fixes:
-
-- Fix a crash when loading information from Flatpak apps
-- Fix fd handling to prevent EBADF errors
+- Fix a crash when calling `GlobalShortcuts.BindShortcuts` with an empty list
+  (#1732)
+- Fix a crash when passing Request token handles which contain `-` (#1748)
+- Fix tests on systems without access to /proc/cmdline (#1766)
+- Stop accidentally running pytests of subprojects (#1767)
+- Give up trying to unmount an existing fuse mount when shutting down the
+  Document Portal (#1799)
+- Fix compilation on Debian Testing, caused by a wrong cast (#1625)
+- Fix ownership of pidfd for XdpAppInfos (#1810)
+- Fix uninitialized variables (#1825)
+- Do not give access to read-only USB devices when read-write access was
+  requested (#1794)
+- Do not kill PID 0 and handle races properly (#1864)
+- Fix forwarding the `available-source-types` and `available-cursor-modes` from
+  the backend (#1868)
+- Ensure valid WAYLAND_DISPLAY/DISPLAY by launching after the graphical session
+  target (#1830)
 
 Changes in 1.20.1
 =================
@@ -207,7 +360,7 @@ Released: 2023-10-26
 
 - Communicate better when the Background portal kills an app
 - Properly quote Flatpak command in the Background portal
-- Improve documentation of the "cursor_mode" propery of the ScreenCast
+- Improve documentation of the "cursor_mode" property of the ScreenCast
   backend D-Bus interface
 - Fix ScreenCast portal removing transient restore permissions too early.
   This fixes screen sharing dialogs on Chromium asking for the screen multiple
@@ -262,7 +415,7 @@ Released: 2023-08-27
   system components (e.g. MIME types).
 - Various small visual tweaks to the generated documentation
 - Document a new 'accent-color' key in the Settings portal. This key represents
-  an arbitrary color in sRGB colorspace. How implementations of the portal
+  an arbitrary color in sRGB color space. How implementations of the portal
   provide this key is entirely dependent on their internal policies and design.
 - Translation updates
 
@@ -383,7 +536,7 @@ Released: 2021-12-21
 - Place portals in the systemd session.slice
 - settings: Add color-scheme key
 - open-uri: Avoid a sync call to org.freedesktop.FileManager
-- screncast: Allow restoring previous sessions
+- screencast: Allow restoring previous sessions
 - Add a portal for requesting realtime permissions
 - ci: Many improvements
 - Publish the docs from a ci job
@@ -417,7 +570,7 @@ Changes in 1.8.1
 Changes in 1.8.0
 ================
 
-- openuri: Allow skipping the chooser for more URL tyles
+- openuri: Allow skipping the chooser for more URL types
 - openuri: Robustness fixes
 - filechooser: Return the current filter
 - camera: Make the client node visible
@@ -605,7 +758,7 @@ xdg-desktop-portal 0.11
 * Include docs for the session, remote desktop and screencast portals.
 * document-portal: Be more flexible validating apps' IDs.
 * document-portal: Be more strict when checking & granting file access.
-* file-chooser: Fix crash with unitialized data in the save dialog.
+* file-chooser: Fix crash with uninitialized data in the save dialog.
 * open-uri: Don't ever skip showing the dialog if a threshold is set.
 * open-uri: Don't register http: URIs for sandboxed handlers.
 * remote-desktop: Use the correct device type values.

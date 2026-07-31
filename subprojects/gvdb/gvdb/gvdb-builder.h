@@ -1,10 +1,12 @@
 /*
  * Copyright © 2010 Codethink Limited
  *
+ * SPDX-License-Identifier: LGPL-2.1-or-later
+ *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the licence, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -51,10 +53,20 @@ gboolean                gvdb_table_write_contents                       (GHashTa
                                                                          const gchar    *filename,
                                                                          gboolean        byteswap,
                                                                          GError        **error);
+G_GNUC_INTERNAL
+void                    gvdb_table_write_contents_async                 (GHashTable          *table,
+                                                                         const gchar         *filename,
+                                                                         gboolean             byteswap,
+                                                                         GCancellable        *cancellable,
+                                                                         GAsyncReadyCallback  callback,
+                                                                         gpointer             user_data);
+G_GNUC_INTERNAL
+gboolean                gvdb_table_write_contents_finish                (GHashTable          *table,
+                                                                         GAsyncResult        *result,
+                                                                         GError             **error);
 
 G_GNUC_INTERNAL
-GBytes *                gvdb_table_get_content                          (GHashTable     *table,
-                                                                         gboolean        byteswap);
-
+GBytes *                gvdb_table_get_contents                         (GHashTable          *table,
+                                                                         gboolean             byteswap);
 
 #endif /* __gvdb_builder_h__ */

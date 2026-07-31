@@ -24,15 +24,9 @@
 #pragma once
 
 #include "xdp-app-info.h"
-#include "xdp-utils.h"
 #include "xdp-dbus.h"
 #include "xdp-impl-dbus.h"
-
-typedef enum {
-  XDG_DESKTOP_PORTAL_RESPONSE_SUCCESS = 0,
-  XDG_DESKTOP_PORTAL_RESPONSE_CANCELLED,
-  XDG_DESKTOP_PORTAL_RESPONSE_OTHER
-} XdgDesktopPortalResponseEnum;
+#include "xdp-utils.h"
 
 typedef struct _XdpRequest
 {
@@ -43,33 +37,29 @@ typedef struct _XdpRequest
   char *sender;
   GMutex mutex;
   XdpAppInfo *app_info;
+  XdpContext *context;
 
   XdpDbusImplRequest *impl_request;
 } XdpRequest;
 
-typedef struct _XdpRequestClass
+struct _XdpRequestClass
 {
   XdpDbusRequestSkeletonClass parent_class;
-} XdpRequestClass;
+};
 
-GType xdp_request_get_type (void) G_GNUC_CONST;
+#define XDP_TYPE_REQUEST (xdp_request_get_type ())
+G_DECLARE_FINAL_TYPE (XdpRequest,
+                      xdp_request,
+                      XDP, REQUEST,
+                      XdpDbusRequestSkeleton);
 
-G_GNUC_UNUSED static inline XdpRequest *
-XDP_REQUEST (gpointer ptr)
-{
-  return G_TYPE_CHECK_INSTANCE_CAST (ptr, xdp_request_get_type (), XdpRequest);
-}
+#define REQUEST_AUTOLOCK(request) \
+  G_MUTEX_AUTO_LOCK (&request->mutex, G_PASTE (request_auto_locker, __LINE__));
 
-G_GNUC_UNUSED static inline gboolean
-XDP_IS_REQUEST (gpointer ptr)
-{
-  return G_TYPE_CHECK_INSTANCE_TYPE (ptr, xdp_request_get_type ());
-}
-
-G_DEFINE_AUTOPTR_CLEANUP_FUNC (XdpRequest, g_object_unref)
-
-void xdp_request_init_invocation (GDBusMethodInvocation *invocation,
-                                  XdpAppInfo            *app_info);
+gboolean xdp_request_init_invocation (GDBusMethodInvocation  *invocation,
+                                      XdpContext             *context,
+                                      XdpAppInfo             *app_info,
+                                      GError                **error);
 
 XdpRequest *xdp_request_from_invocation (GDBusMethodInvocation *invocation);
 
@@ -80,24 +70,5 @@ void xdp_request_unexport (XdpRequest *request);
 
 const char *xdp_request_get_object_path (XdpRequest *request);
 
-void close_requests_for_sender (const char *sender);
-
 void xdp_request_set_impl_request (XdpRequest         *request,
                                    XdpDbusImplRequest *impl_request);
-
-static inline void
-auto_unlock_helper (GMutex **mutex)
-{
-  if (*mutex)
-    g_mutex_unlock (*mutex);
-}
-
-static inline GMutex *
-auto_lock_helper (GMutex *mutex)
-{
-  if (mutex)
-    g_mutex_lock (mutex);
-  return mutex;
-}
-
-#define REQUEST_AUTOLOCK(request) G_GNUC_UNUSED __attribute__((cleanup (auto_unlock_helper))) GMutex * G_PASTE (request_auto_unlock, __LINE__) = auto_lock_helper (&request->mutex);

@@ -23,16 +23,18 @@
 
 #include "config.h"
 
+#include "xdp-app-info-flatpak-private.h"
+
 #include <errno.h>
 #include <fcntl.h>
-#ifdef HAVE_SYS_VFS_H
-#include <sys/vfs.h>
-#endif
 
 #include <json-glib/json-glib.h>
 
-#include "xdp-app-info-flatpak-private.h"
 #include "xdp-usb-query.h"
+
+#if HAVE_SYS_VFS_H
+#include <sys/vfs.h>
+#endif
 
 #define FLATPAK_ENGINE_ID "org.flatpak"
 
@@ -56,7 +58,7 @@ struct _XdpAppInfoFlatpak
   GPtrArray *queries;
 };
 
-G_DEFINE_FINAL_TYPE (XdpAppInfoFlatpak, xdp_app_info_flatpak, XDP_TYPE_APP_INFO)
+G_DEFINE_FINAL_TYPE (XdpAppInfoFlatpak, xdp_app_info_flatpak, XDP_TYPE_APP_INFO);
 
 static gboolean
 is_valid_initial_name_character (gint c, gboolean allow_dash)
@@ -697,30 +699,90 @@ open_flatpak_info (int      pid,
   return g_steal_fd (&info_fd);
 }
 
-gboolean
-xdp_is_flatpak (int        pid,
-                gboolean  *is_flatpak,
-                GError   **error)
+static XdpAppInfo *
+xdp_app_info_flatpak_new_testing (const char  *sender,
+                                  GError     **error)
 {
-  g_autoptr(GError) local_error = NULL;
-  g_autofd int info_fd = -1;
+  g_autoptr (XdpAppInfoFlatpak) app_info_flatpak = NULL;
+  const char *metadata_path;
+  g_autoptr(GKeyFile) metadata = NULL;
+  gboolean result;
+  const char *group;
+  g_autofree char *id = NULL;
+  g_autofree char *instance = NULL;
+  g_auto(GStrv) shared = NULL;
+  gboolean has_network;
+  XdpAppInfoFlags flags = 0;
 
-  info_fd = open_flatpak_info (pid, &local_error);
-  if (info_fd == -1 && !g_error_matches (local_error, XDP_APP_INFO_ERROR,
-                                         XDP_APP_INFO_ERROR_WRONG_APP_KIND))
+  metadata_path = g_getenv ("XDG_DESKTOP_PORTAL_TEST_FLATPAK_METADATA");
+  g_assert (metadata_path != NULL);
+
+  metadata = g_key_file_new ();
+  result = g_key_file_load_from_file (metadata, metadata_path,
+                                      G_KEY_FILE_NONE, NULL);
+  g_assert (result == TRUE);
+
+  group = FLATPAK_METADATA_GROUP_APPLICATION;
+  if (g_key_file_has_group (metadata, FLATPAK_METADATA_GROUP_RUNTIME))
+    group = FLATPAK_METADATA_GROUP_RUNTIME;
+
+  id = g_key_file_get_string (metadata,
+                              group,
+                              FLATPAK_METADATA_KEY_NAME,
+                              error);
+  g_assert (id != NULL && xdp_is_valid_app_id (id));
+
+  instance = g_key_file_get_string (metadata,
+                                    FLATPAK_METADATA_GROUP_INSTANCE,
+                                    FLATPAK_METADATA_KEY_INSTANCE_ID,
+                                    error);
+  g_assert (instance != NULL);
+
+  shared = g_key_file_get_string_list (metadata,
+                                       FLATPAK_METADATA_GROUP_CONTEXT,
+                                       FLATPAK_METADATA_KEY_SHARED,
+                                       NULL, NULL);
+
+  if (shared)
     {
-      g_propagate_error (error, g_steal_pointer (&local_error));
-      return FALSE;
+      has_network = g_strv_contains ((const char * const *)shared,
+                                     FLATPAK_METADATA_CONTEXT_SHARED_NETWORK);
+    }
+  else
+    {
+      has_network = FALSE;
     }
 
-  *is_flatpak = info_fd != -1;
-  return TRUE;
+  flags |= XDP_APP_INFO_FLAG_REQUIRE_GAPPINFO;
+  flags |= XDP_APP_INFO_FLAG_SUPPORTS_OPATH;
+  if (has_network)
+    flags |= XDP_APP_INFO_FLAG_HAS_NETWORK;
+
+  app_info_flatpak = g_initable_new (XDP_TYPE_APP_INFO_FLATPAK,
+                                     NULL,
+                                     error,
+                                     "engine", FLATPAK_ENGINE_ID,
+                                     "flags", flags,
+                                     "id", id,
+                                     "instance", instance,
+                                     "sender", sender,
+                                     NULL);
+
+  app_info_flatpak->flatpak_info = g_steal_pointer (&metadata);
+
+  return XDP_APP_INFO (g_steal_pointer (&app_info_flatpak));
 }
 
+/*
+ * @pidfd: (inout) (not nullable): Pointer to process ID file descriptor.
+ *  This function may take ownership of the fd. If it does, it will
+ *  set `*pidfd` to -1.
+ */
 XdpAppInfo *
-xdp_app_info_flatpak_new (int      pid,
-                          int     *pidfd,
-                          GError **error)
+xdp_app_info_flatpak_new (const char  *sender,
+                          int          pid,
+                          int         *pidfd,
+                          GError     **error)
 {
   g_autoptr (XdpAppInfoFlatpak) app_info_flatpak = NULL;
   XdpAppInfoFlags flags = 0;
@@ -735,6 +797,21 @@ xdp_app_info_flatpak_new (int      pid,
   g_auto(GStrv) shared = NULL;
   gboolean has_network;
   g_autofd int bwrap_pidfd = -1;
+  const char *test_app_info_kind;
+
+  test_app_info_kind = g_getenv ("XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND");
+  if (test_app_info_kind)
+    {
+      if (g_strcmp0 (test_app_info_kind, "flatpak") != 0)
+        {
+          g_set_error (error, XDP_APP_INFO_ERROR, XDP_APP_INFO_ERROR_WRONG_APP_KIND,
+                       "Testing requested different AppInfo kind: %s",
+                       test_app_info_kind);
+          return NULL;
+        }
+
+      return xdp_app_info_flatpak_new_testing (sender, error);
+    }
 
   info_fd = open_flatpak_info (pid, error);
   if (info_fd == -1)
@@ -823,6 +900,7 @@ xdp_app_info_flatpak_new (int      pid,
                                      "id", id,
                                      "instance", instance,
                                      "pidfd", g_steal_fd (&bwrap_pidfd),
+                                     "sender", sender,
                                      NULL);
   if (!app_info_flatpak)
     return NULL;

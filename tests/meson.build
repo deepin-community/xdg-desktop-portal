@@ -3,7 +3,6 @@ env_tests.set('XDG_DATA_DIRS', meson.current_build_dir() / 'share')
 env_tests.set('G_TEST_SRCDIR', meson.current_source_dir())
 env_tests.set('G_TEST_BUILDDIR', meson.current_build_dir())
 env_tests.set('G_DEBUG', 'gc-friendly')  # from glib-tap.mk
-env_tests.set('LSAN_OPTIONS', 'suppressions=' + meson.current_source_dir() / 'asan.suppression')
 
 if glib_dep.version().version_compare('>= 2.68')
   test_protocol = 'tap'
@@ -15,7 +14,7 @@ subdir('dbs')
 test_permission_db = executable(
   'test-permission-db',
   ['test-permission-db.c'] + db_sources,
-  dependencies: [common_deps],
+  dependencies: [common_deps] + db_deps,
   include_directories: [common_includes],
   install: enable_installed_tests,
   install_dir: installed_tests_dir,
@@ -71,6 +70,7 @@ pytest_args = ['--verbose', '--log-level=DEBUG']
 
 pytest_env = environment()
 pytest_env.set('BUILDDIR', meson.project_build_root())
+pytest_env.set('UNDER_MESON', '1')
 
 # pytest xdist is nice because it significantly speeds up our
 # test process, but it's not required
@@ -119,7 +119,6 @@ template_files = [
   'templates/geoclue2.py',
   'templates/globalshortcuts.py',
   'templates/inhibit.py',
-  'templates/__init__.py',
   'templates/inputcapture.py',
   'templates/lockdown.py',
   'templates/notification.py',
@@ -129,6 +128,7 @@ template_files = [
   'templates/settings.py',
   'templates/usb.py',
   'templates/wallpaper.py',
+  'templates/xdp_utils.py',
 ]
 
 foreach pytest_file : pytest_files
@@ -137,6 +137,13 @@ foreach pytest_file : pytest_files
     'integration/@0@'.format(testname),
     run_test,
     args: [meson.current_source_dir() / pytest_file] + pytest_args,
+    depends: [
+      xdg_desktop_portal,
+      xdp_validate_icon,
+      xdp_validate_sound,
+      xdg_permission_store,
+      xdg_document_portal,
+    ],
     env: pytest_env,
     suite: ['integration'],
     timeout: 120,
@@ -148,7 +155,10 @@ if enable_installed_tests
     pytest_files,
     '__init__.py',
     'conftest.py',
+    'xdp_utils.py',
+    'xdp_doc_utils.py',
     'asan.suppression',
+    'valgrind.suppression',
     install_dir: installed_tests_dir / 'tests',
   )
   install_data(

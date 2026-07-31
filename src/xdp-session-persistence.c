@@ -21,14 +21,43 @@
 
 #include "config.h"
 
-#include "xdp-permissions.h"
 #include "xdp-session-persistence.h"
+
+#include "xdp-permissions.h"
 
 static GMutex transient_permissions_lock;
 static GHashTable *transient_permissions;
 
 #define RESTORE_DATA_TYPE "(suv)"
 
+static void
+on_peer_disconnect (XdpContext *context,
+                    const char *peer,
+                    gpointer    user_data)
+{
+  g_autoptr(GMutexLocker) locker = NULL;
+  GHashTableIter iter;
+  const char *key;
+
+  locker = g_mutex_locker_new (&transient_permissions_lock);
+
+  if (!transient_permissions)
+    return;
+
+  g_hash_table_iter_init (&iter, transient_permissions);
+  while (g_hash_table_iter_next (&iter, (gpointer *) &key, NULL))
+    {
+      g_auto(GStrv) split = g_strsplit (key, "/", 2);
+
+      if (split && split[0] && g_strcmp0 (split[0], peer) == 0)
+        g_hash_table_iter_remove (&iter);
+    }
+}
+
+/*
+ * Transient permissions are scoped by session->sender: the hash key is
+ * "sender/token", so a token is only valid for the peer that created it.
+ */
 void
 xdp_session_persistence_set_transient_permissions (XdpSession *session,
                                                    const char *restore_token,
@@ -41,6 +70,10 @@ xdp_session_persistence_set_transient_permissions (XdpSession *session,
       transient_permissions =
         g_hash_table_new_full (g_str_hash, g_str_equal,
                                g_free, (GDestroyNotify) g_variant_unref);
+
+      g_signal_connect (session->context, "peer-disconnect",
+                        G_CALLBACK (on_peer_disconnect),
+                        NULL);
     }
 
   g_hash_table_insert (transient_permissions,
@@ -62,29 +95,6 @@ xdp_session_persistence_delete_transient_permissions (XdpSession *session,
   g_hash_table_remove (transient_permissions, id);
 }
 
-void
-xdp_session_persistence_delete_transient_permissions_for_sender (const char *sender_name)
-{
-
-  g_autoptr(GMutexLocker) locker = NULL;
-  GHashTableIter iter;
-  const char *key;
-
-  locker = g_mutex_locker_new (&transient_permissions_lock);
-
-  if (!transient_permissions)
-    return;
-
-  g_hash_table_iter_init (&iter, transient_permissions);
-  while (g_hash_table_iter_next (&iter, (gpointer *) &key, NULL))
-    {
-      g_auto(GStrv) split = g_strsplit (key, "/", 2);
-
-      if (split && split[0] && g_strcmp0 (split[0], sender_name) == 0)
-        g_hash_table_iter_remove (&iter);
-    }
-}
-
 GVariant *
 xdp_session_persistence_get_transient_permissions (XdpSession *session,
                                                    const char *restore_token)
@@ -101,6 +111,10 @@ xdp_session_persistence_get_transient_permissions (XdpSession *session,
   return permissions ? g_variant_ref (permissions) : NULL;
 }
 
+/*
+ * Persistent permissions are scoped by session->app_id: the permission
+ * store entry is keyed by token, but lookup checks that app_id has access.
+ */
 void
 xdp_session_persistence_set_persistent_permissions (XdpSession *session,
                                                     const char *table,
@@ -157,7 +171,7 @@ xdp_session_persistence_get_persistent_permissions (XdpSession *session,
   g_autoptr(GVariant) perms = NULL;
   g_autoptr(GVariant) data = NULL;
   g_autoptr(GError) error = NULL;
-  const char **permissions;
+  g_autofree const char **permissions = NULL;
 
   if (!xdp_dbus_impl_permission_store_call_lookup_sync (xdp_get_permission_store (),
                                                         table,
@@ -292,7 +306,7 @@ xdp_session_persistence_generate_and_save_restore_token (XdpSession *session,
 
     case XDP_SESSION_PERSISTENCE_MODE_TRANSIENT:
       if (!*in_out_restore_token)
-        *in_out_restore_token = g_uuid_string_random ();
+        *in_out_restore_token = xdp_generate_token ();
 
       xdp_session_persistence_set_transient_permissions (session,
                                                          *in_out_restore_token,
@@ -301,7 +315,7 @@ xdp_session_persistence_generate_and_save_restore_token (XdpSession *session,
 
     case XDP_SESSION_PERSISTENCE_MODE_PERSISTENT:
       if (!*in_out_restore_token)
-        *in_out_restore_token = g_uuid_string_random ();
+        *in_out_restore_token = xdp_generate_token ();
 
       xdp_session_persistence_set_persistent_permissions (session,
                                                           table,
@@ -366,13 +380,53 @@ xdp_session_persistence_replace_restore_data_with_token (XdpSession *session,
                                                                *in_out_persist_mode,
                                                                in_out_restore_token,
                                                                in_out_restore_data);
-      g_variant_builder_add (&results_builder, "{sv}", "restore_token",
-                             g_variant_new_string (*in_out_restore_token));
+      if (*in_out_restore_token)
+        {
+          g_variant_builder_add (&results_builder, "{sv}", "restore_token",
+                                 g_variant_new_string (*in_out_restore_token));
+        }
     }
   else
     {
       *in_out_persist_mode = XDP_SESSION_PERSISTENCE_MODE_NONE;
+      g_clear_pointer (in_out_restore_token, g_free);
     }
 
   *in_out_results = g_variant_ref_sink (g_variant_builder_end (&results_builder));
+}
+
+
+gboolean
+xdp_session_persistence_validate_restore_token (const char  *restore_token,
+                                                GError     **error)
+{
+  /* Accept both xdp_generate_token() format and legacy UUID strings
+   * from older portal versions */
+  if (!xdp_is_valid_token (restore_token) &&
+      !g_uuid_string_is_valid (restore_token))
+    {
+      g_set_error (error,
+                   XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "Restore token is not valid");
+      return FALSE;
+    }
+
+  return TRUE;
+}
+
+gboolean
+xdp_session_persistence_validate_persist_mode (XdpSessionPersistenceMode   mode,
+                                               GError                    **error)
+{
+  if (mode > XDP_SESSION_PERSISTENCE_MODE_PERSISTENT)
+    {
+      g_set_error (error,
+                   XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "Invalid persist mode %x", mode);
+      return FALSE;
+    }
+
+  return TRUE;
 }

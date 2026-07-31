@@ -22,18 +22,21 @@
 
 #include "config.h"
 
+#include "realtime.h"
+
 #include <string.h>
+
 #include <gio/gio.h>
 
-#include "realtime.h"
-#include "xdp-call.h"
-#include "xdp-permissions.h"
 #include "xdp-app-info.h"
+#include "xdp-context.h"
 #include "xdp-dbus.h"
+#include "xdp-permissions.h"
 #include "xdp-utils.h"
 
-#define PERMISSION_TABLE "realtime"
-#define PERMISSION_ID "realtime"
+#define RTKIT_DBUS_NAME "org.freedesktop.RealtimeKit1"
+#define RTKIT_DBUS_IFACE "org.freedesktop.RealtimeKit1"
+#define RTKIT_DBUS_PATH "/org/freedesktop/RealtimeKit1"
 
 typedef struct _Realtime Realtime;
 typedef struct _RealtimeClass RealtimeClass;
@@ -49,14 +52,14 @@ struct _RealtimeClass
   XdpDbusRealtimeSkeletonClass parent_class;
 };
 
-static Realtime *realtime;
-
 GType realtime_get_type (void) G_GNUC_CONST;
 static void realtime_iface_init (XdpDbusRealtimeIface *iface);
 
 G_DEFINE_TYPE_WITH_CODE (Realtime, realtime, XDP_DBUS_TYPE_REALTIME_SKELETON,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_REALTIME,
                                                 realtime_iface_init));
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (Realtime, g_object_unref)
 
 static gboolean
 map_pid (XdpAppInfo *app_info, pid_t *pid, pid_t *tid, GError **error)
@@ -119,12 +122,12 @@ handle_make_thread_realtime_with_pid (XdpDbusRealtime       *object,
                                       guint64                thread,
                                       guint32                priority)
 {
-  g_autoptr (GError) error = NULL;
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  Realtime *realtime = (Realtime *)object;
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
   pid_t pids[1] = { process };
   pid_t tids[1] = { thread };
-  const char *app_id = xdp_app_info_get_id (call->app_info);
   XdpPermission permission;
+  g_autoptr (GError) error = NULL;
 
   if (!realtime->rtkit_proxy)
     {
@@ -135,7 +138,9 @@ handle_make_thread_realtime_with_pid (XdpDbusRealtime       *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  permission = xdp_get_permission_sync (app_id, PERMISSION_TABLE, PERMISSION_ID);
+  permission = xdp_get_permission_sync (app_info,
+                                        REALTIME_PERMISSION_TABLE,
+                                        REALTIME_PERMISSION_ID);
   if (permission == XDP_PERMISSION_NO)
     {
       g_dbus_method_invocation_return_error (invocation,
@@ -145,7 +150,7 @@ handle_make_thread_realtime_with_pid (XdpDbusRealtime       *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  if (!map_pid (call->app_info, pids, tids, &error))
+  if (!map_pid (app_info, pids, tids, &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -170,12 +175,12 @@ handle_make_thread_high_priority_with_pid (XdpDbusRealtime       *object,
                                            guint64                thread,
                                            gint32                 priority)
 {
-  g_autoptr (GError) error = NULL;
-  XdpCall *call = xdp_call_from_invocation (invocation);
+  Realtime *realtime = (Realtime *)object;
+  XdpAppInfo *app_info = xdp_invocation_get_app_info (invocation);
   pid_t pids[1] = { process };
   pid_t tids[1] = { thread };
-  const char *app_id = xdp_app_info_get_id (call->app_info);
   XdpPermission permission;
+  g_autoptr (GError) error = NULL;
 
   if (!realtime->rtkit_proxy)
     {
@@ -186,7 +191,9 @@ handle_make_thread_high_priority_with_pid (XdpDbusRealtime       *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  permission = xdp_get_permission_sync (app_id, PERMISSION_TABLE, PERMISSION_ID);
+  permission = xdp_get_permission_sync (app_info,
+                                        REALTIME_PERMISSION_TABLE,
+                                        REALTIME_PERMISSION_ID);
   if (permission == XDP_PERMISSION_NO)
     {
       g_dbus_method_invocation_return_error (invocation,
@@ -196,7 +203,7 @@ handle_make_thread_high_priority_with_pid (XdpDbusRealtime       *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  if (!map_pid (call->app_info, pids, tids, &error))
+  if (!map_pid (app_info, pids, tids, &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -224,7 +231,6 @@ realtime_iface_init (XdpDbusRealtimeIface *iface)
 static void
 realtime_init (Realtime *realtime)
 {
-  xdp_dbus_realtime_set_version (XDP_DBUS_REALTIME (realtime), 1);
 }
 
 static void
@@ -246,8 +252,9 @@ realtime_class_init (RealtimeClass *klass)
 }
 
 static void
-load_all_properties (GDBusProxy *proxy)
+load_all_properties (Realtime *realtime)
 {
+  GDBusProxy *proxy = realtime->rtkit_proxy;
   const char * properties[] = { "MaxRealtimePriority", "MinNiceLevel", "RTTimeUSecMax" };
   enum prop_type { MAX_REALTIME_PRIORITY, MIN_NICE_LEVEL, RTTIME_USEC_MAX };
 
@@ -257,9 +264,9 @@ load_all_properties (GDBusProxy *proxy)
       GVariant *parameters;
       g_autoptr (GError) error = NULL;
 
-      parameters = g_variant_new ("(ss)", "org.freedesktop.RealtimeKit1", properties[i]);
+      parameters = g_variant_new ("(ss)", RTKIT_DBUS_IFACE, properties[i]);
       result = g_dbus_proxy_call_sync (proxy,
-                                       "org.freedesktop.DBus.Properties.Get",
+                                       DBUS_DBUS_IFACE ".Properties.Get",
                                         g_steal_pointer (&parameters),
                                         G_DBUS_CALL_FLAGS_NONE,
                                         -1,
@@ -292,18 +299,19 @@ load_all_properties (GDBusProxy *proxy)
     }
 }
 
-GDBusInterfaceSkeleton *
-realtime_create (GDBusConnection *connection)
+static Realtime *
+realtime_new (void)
 {
-  GDBusProxy *rtkit_proxy = NULL;
-  g_autoptr (GError) error = NULL;
+  Realtime *realtime;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GDBusProxy) rtkit_proxy = NULL;
 
   rtkit_proxy = g_dbus_proxy_new_for_bus_sync (G_BUS_TYPE_SYSTEM,
                                                G_DBUS_PROXY_FLAGS_NONE,
                                                NULL,
-                                               "org.freedesktop.RealtimeKit1",
-                                               "/org/freedesktop/RealtimeKit1",
-                                               "org.freedesktop.RealtimeKit1",
+                                               RTKIT_DBUS_NAME,
+                                               RTKIT_DBUS_PATH,
+                                               RTKIT_DBUS_IFACE,
                                                NULL,
                                                &error);
   if (!rtkit_proxy)
@@ -316,8 +324,22 @@ realtime_create (GDBusConnection *connection)
   realtime = g_object_new (realtime_get_type (), NULL);
   realtime->rtkit_proxy = g_steal_pointer (&rtkit_proxy);
 
-  if (realtime->rtkit_proxy)
-    load_all_properties (realtime->rtkit_proxy);
+  xdp_dbus_realtime_set_version (XDP_DBUS_REALTIME (realtime), 1);
 
-  return G_DBUS_INTERFACE_SKELETON (realtime);
+  if (realtime->rtkit_proxy)
+    load_all_properties (realtime);
+
+  return realtime;
+}
+
+void
+init_realtime (XdpContext *context)
+{
+  g_autoptr(Realtime) realtime = NULL;
+
+  realtime = realtime_new ();
+
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&realtime)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }

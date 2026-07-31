@@ -24,40 +24,40 @@
 
 #include "config.h"
 
-#define FUSE_USE_VERSION 35
+#include "document-portal-fuse.h"
 
-#include <glib-unix.h>
-
-#include <fuse_lowlevel.h>
-#include <stdio.h>
-#include <string.h>
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <stdlib.h>
-#include <assert.h>
-#include <glib/gprintf.h>
-#include <gio/gio.h>
 #include <pthread.h>
-#ifdef HAVE_SYS_STATFS_H
-#include <sys/statfs.h>
-#endif
-#include <sys/types.h>
-#ifdef HAVE_SYS_MOUNT_H
-#include <sys/mount.h>
-#endif
-#ifdef HAVE_SYS_XATTR_H
-#include <sys/xattr.h>
-#endif
-#ifdef HAVE_SYS_EXTATTR_H
-#include <sys/extattr.h>
-#endif
-#include <sys/time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
+#include <sys/time.h>
+#include <sys/types.h>
 
-#include "document-portal-fuse.h"
+#define FUSE_USE_VERSION 35
+#include <fuse_lowlevel.h>
+#include <gio/gio.h>
+#include <glib-unix.h>
+#include <glib/gprintf.h>
+
 #include "document-store.h"
 #include "src/xdp-utils.h"
 
+#if HAVE_SYS_STATFS_H
+#include <sys/statfs.h>
+#endif
+#if HAVE_SYS_MOUNT_H
+#include <sys/mount.h>
+#endif
+#if HAVE_SYS_XATTR_H
+#include <sys/xattr.h>
+#endif
+#if HAVE_SYS_EXTATTR_H
+#include <sys/extattr.h>
+#endif
 #ifndef O_FSYNC
 #define O_FSYNC O_SYNC
 #endif
@@ -140,7 +140,6 @@ static GThread *fuse_thread = NULL;
 static struct fuse_session *session = NULL;
 G_LOCK_DEFINE (session);
 static char *mount_path = NULL;
-static pthread_t fuse_pthread = 0;
 static uid_t my_uid;
 static gid_t my_gid;
 
@@ -191,6 +190,7 @@ struct _XdpDomain {
   guint64 doc_dir_device;
   guint64 doc_dir_inode;
   guint32 doc_flags;
+  GBytes *doc_dir_handle;
 
   /* Below is mutable, protected by mutex */
   GMutex  tempfile_mutex;
@@ -383,7 +383,7 @@ open_flags_to_string (int flags)
     g_string_append (s, ",TMPFILE");
 #endif
 
-  return g_string_free (s, FALSE);
+  return g_string_free_and_steal (s);
 }
 
 
@@ -420,7 +420,7 @@ setattr_flags_to_string (int flags)
   if (s->len > 0)
     g_string_truncate (s, s->len - 1);
 
-  return g_string_free (s, FALSE);
+  return g_string_free_and_steal (s);
 }
 
 static char *
@@ -429,20 +429,24 @@ renameat2_flags_to_string (int flags)
 #if HAVE_RENAMEAT2
   GString *s = g_string_new ("");
 
+#ifdef RENAME_EXCHANGE
   if (flags & RENAME_EXCHANGE)
     g_string_append (s, "EXCHANGE,");
+#endif
 
   if (flags & RENAME_NOREPLACE)
     g_string_append (s, "NOREPLACE,");
 
+#ifdef RENAME_WHITEOUT
   if (flags & RENAME_WHITEOUT)
     g_string_append (s, "WHITEOUT,");
+#endif
 
   /* Remove last comma */
   if (s->len > 0)
     g_string_truncate (s, s->len - 1);
 
-  return g_string_free (s, FALSE);
+  return g_string_free_and_steal (s);
 #else
   return g_strdup_printf ("%#x", flags);
 #endif
@@ -561,6 +565,7 @@ xdp_domain_unref (XdpDomain *domain)
       g_free (domain->app_id);
       g_free (domain->doc_path);
       g_free (domain->doc_file);
+      g_clear_pointer (&domain->doc_dir_handle, g_bytes_unref);
       if (domain->inodes)
         g_assert (g_hash_table_size (domain->inodes) == 0);
       g_clear_pointer (&domain->inodes, g_hash_table_unref);
@@ -645,6 +650,7 @@ xdp_domain_new_document (XdpDomain         *parent,
   domain->doc_flags = document_entry_get_flags (doc_entry);
   domain->doc_dir_device = document_entry_get_device (doc_entry);
   domain->doc_dir_inode =  document_entry_get_inode (doc_entry);
+  domain->doc_dir_handle = document_entry_dup_handle (doc_entry);
 
   db_path = document_entry_get_path (doc_entry);
   if (xdp_document_domain_is_dir (domain))
@@ -957,16 +963,38 @@ xdp_inode_kernel_unref (XdpInode *inode, unsigned long count)
 }
 
 static int
-verify_doc_dir_devino (int dirfd, XdpDomain *doc_domain)
+xdp_domain_get_doc_dir (XdpDomain   *doc_domain,
+                        int         *dirfd_out,
+                        struct stat *buf_out)
 {
-  struct stat buf;
+  g_autofd int dirfd = -1;
+  struct stat local_buf;
+  struct stat *buf = buf_out ? buf_out : &local_buf;
 
-  if (fstat (dirfd, &buf) != 0)
+  dirfd = open (doc_domain->doc_path, O_PATH | O_DIRECTORY);
+  if (dirfd < 0)
     return -errno;
 
-  if (buf.st_ino != doc_domain->doc_dir_inode ||
-      buf.st_dev != doc_domain->doc_dir_device)
-    return -ENOENT;
+  if (fstat (dirfd, buf) != 0)
+    return -errno;
+
+  if (doc_domain->doc_dir_handle != NULL)
+    {
+      /* If we have a handle, use it exclusively — st_dev is not stable across reboots */
+      g_autoptr(GBytes) handle = xdp_file_handle_for_fd (dirfd);
+
+      if (handle == NULL || !g_bytes_equal (handle, doc_domain->doc_dir_handle))
+        return -ENOENT;
+    }
+  else
+    {
+      if (buf->st_ino != doc_domain->doc_dir_inode ||
+          buf->st_dev != doc_domain->doc_dir_device)
+        return -ENOENT;
+    }
+
+  if (dirfd_out)
+    *dirfd_out = g_steal_fd (&dirfd);
 
   return 0;
 }
@@ -984,11 +1012,7 @@ xdp_nonphysical_document_inode_opendir (XdpInode *inode)
   g_assert (domain->type == XDP_DOMAIN_DOCUMENT);
   g_assert (inode->physical == NULL);
 
-  dirfd = open (domain->doc_path, O_PATH | O_DIRECTORY);
-  if (dirfd < 0)
-    return -errno;
-
-  res = verify_doc_dir_devino (dirfd, domain);
+  res = xdp_domain_get_doc_dir (domain, &dirfd, NULL);
   if (res != 0)
     return res;
 
@@ -1202,7 +1226,7 @@ xdp_document_inode_open_child_fd (XdpInode   *inode,
 
       if (xdp_document_domain_is_dir (domain))
         {
-          if (strcmp (name, domain->doc_file) == 0)
+          if (g_strcmp0 (name, domain->doc_file) == 0)
             {
               /* Ensure toplevel dir exist and is right */
               dirfd = xdp_nonphysical_document_inode_opendir (inode);
@@ -1222,7 +1246,7 @@ xdp_document_inode_open_child_fd (XdpInode   *inode,
           if (dirfd < 0)
             return dirfd;
 
-          if (strcmp (name, domain->doc_file) == 0)
+          if (g_strcmp0 (name, domain->doc_file) == 0)
             {
               fd = openat (dirfd, name, open_flags, mode);
               if (fd == -1)
@@ -1435,10 +1459,6 @@ stat_virtual_inode (XdpInode    *inode,
           if (entry == NULL || !app_can_write_doc (entry, inode->domain->app_id))
             buf->st_mode &= ~(0222);
         }
-      break;
-
-    default:
-      g_assert_not_reached ();
       break;
     }
 }
@@ -1780,7 +1800,7 @@ ensure_doc_inode (XdpInode   *parent,
   return g_steal_pointer (&inode);
 }
 
-static gboolean
+static void
 invalidate_dentry_cb (gpointer user_data)
 {
   GList *to_invalidate = NULL;
@@ -1801,8 +1821,6 @@ invalidate_dentry_cb (gpointer user_data)
     }
 
   g_list_free (to_invalidate);
-
-  return FALSE;
 }
 
 /* Queue an inval_dentry, thereby freeing unused inodes in the dcache
@@ -1817,16 +1835,17 @@ queue_invalidate_dentry (XdpInode   *parent,
   for (GList *l = invalidate_list; l != NULL; l = l->next)
     {
       XdpInvalidateData *data = l->data;
-      if (data->parent_ino == parent->ino && strcmp (name, data->name) == 0)
+      if (data->parent_ino == parent->ino && g_strcmp0 (name, data->name) == 0)
         return;
     }
 
-  XdpInvalidateData *data = g_malloc0 (sizeof (XdpInvalidateData) + strlen (name) + 1);
+  size_t name_buf_size = strlen (name) + 1;
+  XdpInvalidateData *data = g_malloc0 (sizeof (XdpInvalidateData) + name_buf_size);
   data->parent_ino = parent->ino;
-  strcpy (data->name, name);
+  memcpy (data->name, name, name_buf_size);
 
   if (invalidate_list == NULL)
-    g_timeout_add (10, invalidate_dentry_cb, NULL);
+    g_timeout_add_once (10, invalidate_dentry_cb, NULL);
 
   invalidate_list = g_list_append (invalidate_list, data);
 }
@@ -1846,7 +1865,7 @@ xdp_fuse_lookup (fuse_req_t  req,
 
   g_debug ("LOOKUP %" G_GINT64_MODIFIER "x:%s", parent_ino, name);
 
-  if (strcmp (name, ".") == 0 || strcmp (name, "..") == 0)
+  if (g_strcmp0 (name, ".") == 0 || g_strcmp0 (name, "..") == 0)
     {
       /* We don't set FUSE_CAP_EXPORT_SUPPORT, so should not get
        * here. But lets make sure we never ever resolve them as that
@@ -1859,7 +1878,7 @@ xdp_fuse_lookup (fuse_req_t  req,
       switch (parent_domain->type)
         {
         case XDP_DOMAIN_ROOT:
-          if (strcmp (name, BY_APP_NAME) == 0)
+          if (g_strcmp0 (name, BY_APP_NAME) == 0)
             inode = xdp_inode_ref (by_app_inode);
           else
             inode = ensure_doc_inode (parent, name);
@@ -1870,7 +1889,7 @@ xdp_fuse_lookup (fuse_req_t  req,
         case XDP_DOMAIN_APP:
           inode = ensure_doc_inode (parent, name);
           break;
-        default:
+        case XDP_DOMAIN_DOCUMENT:
           g_assert_not_reached ();
         }
 
@@ -1935,6 +1954,7 @@ xdp_fuse_open (fuse_req_t             req,
   g_autofree char *open_flags_string = open_flags_to_string (open_flags);
   int fd;
   g_autofree char *path = NULL;
+  /* goblint-ignore-next-line: use_g_autoptr_inline_cleanup */
   XdpFile *file = NULL;
   XdpDocumentChecks checks;
   const char *op = "OPEN";
@@ -1969,8 +1989,7 @@ xdp_fuse_open (fuse_req_t             req,
       if (res < 0)
         return xdp_reply_err (op, req, errno);
 
-      g_clear_pointer (&path, g_free);
-      path = g_strdup (resolved_path);
+      g_set_str (&path, resolved_path);
     }
 
   fd = open (path, open_flags, 0);
@@ -2002,6 +2021,7 @@ xdp_fuse_create (fuse_req_t             req,
   g_autofd int fd = -1;
   g_autofd int o_path_fd = -1;
   g_autofree char *fd_path = NULL;
+  /* goblint-ignore-next-line: use_g_autoptr_inline_cleanup */
   XdpFile *file = NULL;
   const char *op = "CREATE";
 
@@ -2327,6 +2347,7 @@ xdp_fuse_opendir (fuse_req_t             req,
 {
   g_autoptr(XdpInode) inode = xdp_inode_from_ino (ino);
   XdpDomain *domain = inode->domain;
+  /* goblint-ignore-next-line: use_g_autoptr_inline_cleanup */
   XdpDir *d = NULL;
   const char *op = "OPENDIR";
 
@@ -2347,7 +2368,7 @@ xdp_fuse_opendir (fuse_req_t             req,
         case XDP_DOMAIN_BY_APP:
           xdp_dir_add_apps (d, inode->domain, req, NULL);
           break;
-        default:
+        case XDP_DOMAIN_DOCUMENT:
           g_assert_not_reached ();
         }
     }
@@ -2382,12 +2403,8 @@ xdp_fuse_opendir (fuse_req_t             req,
 
               d = xdp_dir_new_buffered (req);
 
-              if (stat (domain->doc_path, &buf) == 0 &&
-                  buf.st_ino == domain->doc_dir_inode &&
-                  buf.st_dev == domain->doc_dir_device)
-                {
-                  xdp_dir_add (d, req, domain->doc_file, buf.st_mode);
-                }
+              if (xdp_domain_get_doc_dir (domain, NULL, &buf) == 0)
+                xdp_dir_add (d, req, domain->doc_file, buf.st_mode);
             }
         }
       else
@@ -2630,7 +2647,7 @@ xdp_fuse_unlink (fuse_req_t  req,
       if (dirfd < 0)
         xdp_reply_err (op, req, -dirfd);
 
-      if (strcmp (filename, parent_domain->doc_file) == 0)
+      if (g_strcmp0 (filename, parent_domain->doc_file) == 0)
         {
           res = unlinkat (dirfd, filename, 0);
           if (res != 0)
@@ -2729,7 +2746,7 @@ xdp_fuse_rename (fuse_req_t    req,
         return xdp_reply_err (op, req, EACCES);
 
       /* Early exit for same file */
-      if (strcmp (name, newname) == 0)
+      if (g_strcmp0 (name, newname) == 0)
         return xdp_reply_ok (op, req);
 
       dirfd = xdp_nonphysical_document_inode_opendir (parent);
@@ -2737,7 +2754,7 @@ xdp_fuse_rename (fuse_req_t    req,
         return xdp_reply_err (op, req, -dirfd);
       close_fd1 = dirfd;
 
-      if (strcmp (name, domain->doc_file) == 0)
+      if (g_strcmp0 (name, domain->doc_file) == 0)
         {
           /* Source is (maybe) main file, destination is tempfile */
           g_autofree char *tmpname = NULL;
@@ -2769,7 +2786,7 @@ xdp_fuse_rename (fuse_req_t    req,
 
           xdp_reply_ok (op, req);
         }
-      else if (strcmp (newname, domain->doc_file) == 0)
+      else if (g_strcmp0 (newname, domain->doc_file) == 0)
         {
           gpointer stolen_value;
 
@@ -2821,8 +2838,7 @@ xdp_fuse_rename (fuse_req_t    req,
 
               found_tempfile = TRUE;
 
-              g_free (tempfile->name);
-              tempfile->name = g_strdup (newname);
+              g_set_str (&tempfile->name, newname);
 
               /* This destroys any pre-existing tempfile with this name */
               g_hash_table_replace (domain->tempfiles, tempfile->name, tempfile);
@@ -3036,6 +3052,19 @@ xdp_fuse_statfs (fuse_req_t req,
 
   g_debug ("STATFS %" G_GINT64_MODIFIER "x", ino);
 
+  if (xdp_domain_is_virtual_type (inode->domain))
+    {
+      /* statfs data doesn't make much sense for a virtual filesystem, so we reply with
+       * a mostly empty buffer, mimicking an empty .statfs. This is consistent with what
+       * libfuse does if we don't supply a statfs implementation. */
+      buf = (struct statvfs) {
+        .f_namemax = 255,
+        .f_bsize = 512,
+      };
+      fuse_reply_statfs (req, &buf);
+      return;
+    }
+
   if (!xdp_document_inode_checks (op, req, inode, 0))
     return;
 
@@ -3169,9 +3198,9 @@ xdp_fuse_setxattr (fuse_req_t  req,
   else
     {
       path = fd_to_path (inode->physical->fd);
-#if defined(HAVE_SYS_XATTR_H)
+#if HAVE_SYS_XATTR_H
       res = setxattr (path, name, value, size, flags);
-#elif defined(HAVE_SYS_EXTATTR_H)
+#elif HAVE_SYS_EXTATTR_H
       res = extattr_set_file (path, EXTATTR_NAMESPACE_USER, name, value, size);
 #else
 #error "Not implemented for your platform"
@@ -3214,9 +3243,9 @@ xdp_fuse_getxattr (fuse_req_t  req,
     }
   else
     {
-#if defined(HAVE_SYS_XATTR_H)
+#if HAVE_SYS_XATTR_H
       res = getxattr (path, name, buf, size);
-#elif defined(HAVE_SYS_EXTATTR_H)
+#elif HAVE_SYS_EXTATTR_H
       res = extattr_get_file (path, EXTATTR_NAMESPACE_USER, name, buf, size);
 #else
 #error "Not implemented for your platform"
@@ -3280,9 +3309,9 @@ xdp_fuse_listxattr (fuse_req_t req,
     }
   else
     {
-#if defined(HAVE_SYS_XATTR_H)
+#if HAVE_SYS_XATTR_H
       res = listxattr (path, buf, size);
-#elif defined(HAVE_SYS_EXTATTR_H)
+#elif HAVE_SYS_EXTATTR_H
       res = extattr_list_file (path, EXTATTR_NAMESPACE_USER, buf, size);
 #else
 #error "Not implemented for your platform"
@@ -3326,9 +3355,9 @@ xdp_fuse_removexattr (fuse_req_t  req,
   else
     {
       path = fd_to_path (inode->physical->fd);
-#if defined(HAVE_SYS_XATTR_H)
+#if HAVE_SYS_XATTR_H
       res = removexattr (path, name);
-#elif defined(HAVE_SYS_EXTATTR_H)
+#elif HAVE_SYS_EXTATTR_H
       res = extattr_delete_file (path, EXTATTR_NAMESPACE_USER, name);
 #else
 #error "Not implemented for your platform"
@@ -3486,13 +3515,13 @@ xdp_fuse_mainloop (struct fuse_session     *se,
   status = getenv ("TEST_DOCUMENT_PORTAL_FUSE_STATUS");
   if (status)
     {
-      GError *error = NULL;
+      g_autoptr(GError) error = NULL;
       g_autoptr(GString) s = g_string_new ("");
 
       g_string_append (s, "ok");
 
       g_file_set_contents (status, s->str, -1, &error);
-      g_assert_no_error (error);
+      g_assert (error == NULL);
     }
 }
 
@@ -3516,11 +3545,11 @@ xdp_fuse_thread (gpointer data)
   struct fuse_loop_config loop_config = {0};
   XdpFuseThreadData *thread_data = data;
   XdpFuseOptions *fuse_opts = NULL;
+  /* goblint-ignore-next-line: use_g_autoptr_inline_cleanup */
   struct fuse_session *se;
   const char *path;
 
   locker = g_mutex_locker_new (&thread_data->lock);
-  fuse_pthread = pthread_self ();
 
   g_cond_signal (&thread_data->cond);
 
@@ -3533,7 +3562,7 @@ xdp_fuse_thread (gpointer data)
     }
 
   fuse_opts = g_new0 (XdpFuseOptions, 1);
-#ifdef WITH_SPLICE
+#if HAVE_SPLICE
   fuse_opts->use_splice = TRUE;
 #endif
 
@@ -3571,7 +3600,7 @@ xdp_fuse_thread (gpointer data)
   xdp_fuse_mainloop (session, &loop_config);
 
   session_locker = g_mutex_locker_new (&G_LOCK_NAME (session));
-  fuse_session_unmount (se);
+  /* unmount is called from xdp_fuse_exit() to wake up this thread */
   fuse_session_destroy (se);
   session = NULL;
 
@@ -3615,18 +3644,17 @@ xdp_fuse_init (GError **error)
   path = xdp_fuse_get_mountpoint ();
 
   if ((stat (path, &st) == -1 && errno == ENOTCONN) ||
-      (((statfs_res = statfs (path, &stfs)) == -1 && errno == ENOTCONN) ||
-       (statfs_res == 0 && stfs.f_type == 0x65735546 /* fuse */)))
+      ((statfs_res = statfs (path, &stfs)) == -1 && errno == ENOTCONN) ||
+      (statfs_res == 0 && stfs.f_type == 0x65735546 /* fuse */))
     {
-      int count;
+      int count = 0;
       char *umount_argv[] = { "fusermount3", "-u", "-z", (char *) path, NULL };
 
       g_spawn_sync (NULL, umount_argv, NULL, G_SPAWN_SEARCH_PATH,
                     NULL, NULL, NULL, NULL, NULL, NULL);
 
       g_usleep (10000); /* 10ms */
-      count = 0;
-      while (stat (path, &st) == -1 && count < 10)
+      while (stat (path, &st) == -1 && count++ < 10)
         g_usleep (10000); /* 10ms */
     }
 
@@ -3673,10 +3701,13 @@ xdp_fuse_exit (void)
     XDP_AUTOLOCK (session);
 
     if (session)
-      fuse_session_exit (session);
-
-    if (fuse_pthread)
-      pthread_kill (fuse_pthread, SIGHUP);
+      {
+        fuse_session_exit (session);
+        /* Unmount to force the FUSE kernel interface to disconnect,
+         * which will cause blocking read() in fuse_session_loop_mt()
+         * to fail and the loop to exit. */
+        fuse_session_unmount (session);
+      }
   }
 
   g_clear_pointer (&fuse_thread, g_thread_join);
@@ -3828,11 +3859,14 @@ xdp_fuse_lookup_id_for_inode (ino_t      ino,
     }
   else
     {
+      struct stat buf;
+
       /* directory document */
 
       /* Only return entire doc for main dir */
-      if (file_devino.dev == domain->doc_dir_device &&
-          file_devino.ino == domain->doc_dir_inode)
+      if (xdp_domain_get_doc_dir (domain, NULL, &buf) == 0 &&
+          buf.st_dev == file_devino.dev &&
+          buf.st_ino == file_devino.ino)
         return g_strdup (domain->doc_id);
 
       /* But maybe its a subfile of the document */

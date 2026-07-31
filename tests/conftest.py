@@ -2,6 +2,8 @@
 #
 # This file is formatted with Python Black
 
+import tests.xdp_utils as xdp
+
 from typing import Any, Dict, Iterator, Optional
 from types import ModuleType
 
@@ -14,6 +16,8 @@ import tempfile
 import subprocess
 import time
 import signal
+import shutil
+
 from pathlib import Path
 from contextlib import chdir
 
@@ -33,6 +37,12 @@ def pytest_sessionfinish(session, exitstatus):
     # tests were skipped
     if exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED:
         session.exitstatus = 77
+
+
+def pytest_make_parametrize_id(config, val):
+    if isinstance(val, xdp.AppInfo):
+        return val.__class__.__name__
+    return None
 
 
 def ensure_environment_set() -> None:
@@ -95,6 +105,7 @@ def create_test_dirs(umockdev: Optional[UMockdev.Testbed]) -> Iterator[None]:
         "XDG_DATA_HOME",
         "XDG_RUNTIME_DIR",
         "XDG_DESKTOP_PORTAL_DIR",
+        "XDP_BIN",
     ]
 
     test_root = tempfile.TemporaryDirectory(
@@ -109,6 +120,50 @@ def create_test_dirs(umockdev: Optional[UMockdev.Testbed]) -> Iterator[None]:
     yield
 
     test_root.cleanup()
+
+
+@pytest.fixture
+def xdp_mocked_executables(xdp_app_info_init: xdp.AppInfo) -> list[xdp.ExecutableMock]:
+    exe = None
+    if isinstance(xdp_app_info_init, xdp.AppInfoFlatpak):
+        exe = "flatpak"
+    elif isinstance(xdp_app_info_init, xdp.AppInfoSnap):
+        exe = "snap"
+    else:
+        return []
+
+    return [
+        xdp.ExecutableMock(
+            executable=exe,
+            access_mode=xdp.FileAccessMode.HIDDEN,
+        )
+    ]
+
+
+@pytest.fixture
+def xdp_available_executables() -> list[str]:
+    return [
+        "true",
+        "bwrap",
+    ]
+
+
+@pytest.fixture
+def xdp_bin_path(create_test_dirs) -> Path:
+    return Path(os.environ["XDP_BIN"])
+
+
+@pytest.fixture(autouse=True)
+def create_xdp_executables(
+    xdp_bin_path, xdp_mocked_executables, xdp_available_executables
+):
+    for mock in xdp_mocked_executables:
+        mock.create(xdp_bin_path)
+
+    for exe_name in xdp_available_executables:
+        exe_path = shutil.which(exe_name)
+        assert exe_path, f"{exe_name} is not installed or not in PATH"
+        (xdp_bin_path / exe_name).symlink_to(exe_path)
 
 
 @pytest.fixture
@@ -393,36 +448,53 @@ def xdp_overwrite_env() -> dict[str, str]:
     return {}
 
 
-@pytest.fixture
-def app_id() -> str:
+@pytest.fixture(
+    params=[
+        xdp.AppInfoHost(),
+        xdp.AppInfoFlatpak(),
+    ]
+    + (
+        [
+            xdp.AppInfoSnap(),
+            xdp.AppInfoLinyaps(),
+        ]
+        if xdp.run_long_tests()
+        else []
+    )
+)
+def xdp_app_info(
+    request,
+) -> xdp.AppInfo:
     """
-    Default fixture which can be used to override the app id that the portal
-    frontend will discover for incoming connections.
+    Default fixture which can be used to override the XdpAppInfo the portal
+    frontend will discover.
+    The default fixture is parametric and will run each test with all the
+    app info kinds.
     """
-    return "org.example.Test"
+
+    return request.param
+
+
+@pytest.fixture(autouse=True)
+def xdp_app_info_init(create_test_dirs, xdp_app_info) -> None:
+    xdp_app_info._initialize()
+    return xdp_app_info
 
 
 @pytest.fixture
 def xdp_env(
     xdp_overwrite_env: dict[str, str],
-    app_id: str,
-    usb_queries: Optional[str],
+    xdp_app_info_init: xdp.AppInfo,
+    xdp_bin_path: Path,
     umockdev: Optional[UMockdev.Testbed],
 ) -> dict[str, str]:
     env = os.environ.copy()
     env["G_DEBUG"] = "fatal-criticals"
     env["XDG_CURRENT_DESKTOP"] = "test"
+    env["PATH"] = xdp_bin_path.as_posix()
 
-    # Workaround for the backport branch. The portal uses this as a signal
-    # to know that it's running in the tests. Specifically the trash portal
-    # needs this to get tested correctly.
-    env["XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND"] = "foobar"
-
-    if app_id:
-        env["XDG_DESKTOP_PORTAL_TEST_APP_ID"] = app_id
-
-    if usb_queries:
-        env["XDG_DESKTOP_PORTAL_TEST_USB_QUERIES"] = usb_queries
+    for key, val in xdp_app_info_init.get_xdp_executable_env().items():
+        env[key] = val
 
     if umockdev:
         env["UMOCKDEV_DIR"] = umockdev.get_root_dir()
@@ -455,9 +527,48 @@ def _maybe_add_asan_preload(executable: Path, env: dict[str, str]) -> None:
     env["LD_PRELOAD"] = f"{libasan}:{preload}"
 
 
+def _valgrind_glib_suppressions() -> str:
+    try:
+        import pkgconfig
+
+        return pkgconfig.variables("glib-2.0")["glib_valgrind_suppressions"]
+    except ImportError:
+        return "/usr/share/glib-2.0/valgrind/glib.supp"
+
+
+@pytest.fixture
+def xdp_valgrind_args() -> list[str]:
+    if not xdp.is_valgrind():
+        return []
+
+    valgrind = shutil.which("valgrind")
+    assert valgrind, "Valgrind is not installed or not in PATH"
+
+    xdp_suppression = test_dir() / "valgrind.suppression"
+    glib_suppression = _valgrind_glib_suppressions()
+
+    return [
+        valgrind,
+        "--tool=memcheck",
+        "--error-exitcode=1",
+        "--track-origins=yes",
+        "--leak-check=full",
+        "--leak-resolution=high",
+        "--num-callers=50",
+        "--show-leak-kinds=definite,possible",
+        "--show-error-list=yes",
+        "--show-realloc-size-zero=no",
+        f"--suppressions={glib_suppression}",
+        f"--suppressions={xdp_suppression}",
+    ]
+
+
 @pytest.fixture
 def xdg_desktop_portal(
-    dbus_con: dbus.Bus, xdg_desktop_portal_path: Path, xdp_env: dict[str, str]
+    dbus_con: dbus.Bus,
+    xdg_desktop_portal_path: Path,
+    xdp_env: dict[str, str],
+    xdp_valgrind_args: list[str],
 ) -> Iterator[subprocess.Popen]:
     """
     Fixture which starts and eventually stops xdg-desktop-portal
@@ -468,7 +579,9 @@ def xdg_desktop_portal(
     env = xdp_env.copy()
     _maybe_add_asan_preload(xdg_desktop_portal_path, env)
 
-    xdg_desktop_portal = subprocess.Popen([xdg_desktop_portal_path], env=env)
+    xdg_desktop_portal = subprocess.Popen(
+        xdp_valgrind_args + [xdg_desktop_portal_path], env=env
+    )
 
     while not dbus_con.name_has_owner("org.freedesktop.portal.Desktop"):
         returncode = xdg_desktop_portal.poll()
@@ -524,6 +637,11 @@ def xdg_document_portal(
     """
     Fixture which starts and eventually stops xdg-document-portal
     """
+    try:
+        xdp.ensure_fuse_supported()
+    except xdp.FuseNotSupportedException as e:
+        pytest.skip(f"No fuse support: {e}")
+
     if not xdg_document_portal_path.exists():
         raise FileNotFoundError(f"{xdg_document_portal_path} does not exist")
 
@@ -531,6 +649,12 @@ def xdg_document_portal(
     # wrong but it usually just results in a weird hang that needs SIGKILL
     env = xdp_env.copy()
     env.pop("LD_PRELOAD", None)
+
+    # The document portal also uses XdpAppInfos to figure out where a request
+    # is coming from. If we don't unset this, it might think the
+    # xdg-desktop-portal is a flatpak or snap app. Would be nice to find a
+    # better solution here.
+    env.pop("XDG_DESKTOP_PORTAL_TEST_APP_INFO_KIND", None)
 
     document_portal = subprocess.Popen([xdg_document_portal_path], env=env)
 
@@ -548,21 +672,23 @@ def xdg_document_portal(
     returncode = document_portal.wait()
     assert returncode == 0
 
+    fuse_mount = Path(os.environ["XDG_RUNTIME_DIR"]) / "doc"
+
+    def unmounted():
+        try:
+            next(fuse_mount.iterdir())
+        except StopIteration:
+            return True
+        return False
+
+    xdp.wait_for(unmounted)
+
 
 @pytest.fixture
 def portals(templates: Any, xdg_desktop_portal: Any, xdg_permission_store: Any) -> None:
     """
     Fixture which starts the required templates, xdg-desktop-portal,
     xdg-document-portal and xdg-permission-store. Most tests require this.
-    """
-    return None
-
-
-@pytest.fixture
-def usb_queries() -> Optional[str]:
-    """
-    Default fixture providing the usb queries the connecting process can
-    enumerate
     """
     return None
 

@@ -22,37 +22,37 @@
 
 #include "config.h"
 
+#include "open-uri.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-
-#include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
-#include <fcntl.h>
 
+#include <gio/gdesktopappinfo.h>
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
-#include <gio/gdesktopappinfo.h>
 
-#include "open-uri.h"
-#include "xdp-request.h"
-#include "xdp-dbus.h"
-#include "xdp-impl-dbus.h"
-#include "xdp-utils.h"
-#include "xdp-permissions.h"
 #include "xdp-app-launch-context.h"
+#include "xdp-context.h"
+#include "xdp-dbus.h"
 #include "xdp-documents.h"
+#include "xdp-impl-dbus.h"
+#include "xdp-permissions.h"
+#include "xdp-portal-config.h"
+#include "xdp-request.h"
+#include "xdp-utils.h"
 
 #define FILE_MANAGER_DBUS_NAME "org.freedesktop.FileManager1"
 #define FILE_MANAGER_DBUS_IFACE "org.freedesktop.FileManager1"
 #define FILE_MANAGER_DBUS_PATH "/org/freedesktop/FileManager1"
 
 #define FILE_MANAGER_SHOW_ITEMS "ShowItems"
-
-#define PERMISSION_TABLE "desktop-used-apps"
 
 #define DEFAULT_THRESHOLD 3
 
@@ -63,6 +63,10 @@ typedef struct _OpenURIClass OpenURIClass;
 struct _OpenURI
 {
   XdpDbusOpenURISkeleton parent_instance;
+
+  XdpDbusImplAppChooser *impl;
+  XdpDbusImplLockdown *lockdown_impl;
+  GAppInfoMonitor *monitor;
 };
 
 struct _OpenURIClass
@@ -77,17 +81,14 @@ enum {
   LAST_PERM
 };
 
-static XdpDbusImplAppChooser *impl;
-static OpenURI *open_uri;
-static GAppInfoMonitor *monitor;
-static XdpDbusImplLockdown *lockdown;
-
 GType open_uri_get_type (void) G_GNUC_CONST;
 static void open_uri_iface_init (XdpDbusOpenURIIface *iface);
 
 G_DEFINE_TYPE_WITH_CODE (OpenURI, open_uri, XDP_DBUS_TYPE_OPEN_URI_SKELETON,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_OPEN_URI,
                                                 open_uri_iface_init));
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (OpenURI, g_object_unref)
 
 static void
 parse_permissions (const char **permissions,
@@ -135,7 +136,7 @@ get_latest_choice_info (const char *app_id,
   g_autoptr(GVariant) out_data = NULL;
 
   if (!xdp_dbus_impl_permission_store_call_lookup_sync (xdp_get_permission_store (),
-                                                        PERMISSION_TABLE,
+                                                        OPEN_URI_PERMISSION_TABLE,
                                                         content_type,
                                                         &out_perms,
                                                         &out_data,
@@ -146,7 +147,7 @@ get_latest_choice_info (const char *app_id,
       /* Not finding an entry for the content type in the permission store is perfectly ok */
       if (!g_error_matches (error, XDG_DESKTOP_PORTAL_ERROR, XDG_DESKTOP_PORTAL_ERROR_NOT_FOUND))
         g_warning ("Unable to retrieve info for '%s' in the %s table of the permission store: %s",
-                   content_type, PERMISSION_TABLE, error->message);
+                   content_type, OPEN_URI_PERMISSION_TABLE, error->message);
       g_clear_error (&error);
     }
 
@@ -330,7 +331,7 @@ update_permissions_store (const char *app_id,
 
 
   if (!xdp_dbus_impl_permission_store_call_set_permission_sync (xdp_get_permission_store (),
-                                                                PERMISSION_TABLE,
+                                                                OPEN_URI_PERMISSION_TABLE,
                                                                 TRUE,
                                                                 content_type,
                                                                 app_id,
@@ -423,6 +424,7 @@ app_chooser_done (GObject *source,
     g_object_set_data_full (G_OBJECT (request), "options", g_variant_ref (options), (GDestroyNotify)g_variant_unref);
 
   task = g_task_new (NULL, NULL, NULL, NULL);
+  g_task_set_source_tag (task, app_chooser_done);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, send_response_in_thread_func);
 }
@@ -441,7 +443,7 @@ resolve_scheme_and_content_type (const char *uri,
   if (*scheme == NULL)
     return;
 
-  if (strcmp (*scheme, "file") == 0)
+  if (g_strcmp0 (*scheme, "file") == 0)
     {
       g_debug ("Not handling file uri %s", uri);
       return;
@@ -459,7 +461,7 @@ get_content_type_for_file (const char  *path,
   g_autoptr(GFile) file = g_file_new_for_path (path);
   g_autoptr(GFileInfo) info = g_file_query_info (file,
                                                  G_FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE,
-                                                 0,
+                                                 G_FILE_QUERY_INFO_NONE,
                                                  NULL,
                                                  &error);
 
@@ -551,20 +553,22 @@ find_recommended_choices (const char *scheme,
 }
 
 static void
-app_info_changed (GAppInfoMonitor *monitor,
-                  XdpRequest *request)
+on_app_info_changed (GAppInfoMonitor *monitor,
+                     XdpRequest *request)
 {
+  OpenURI *open_uri;
   const char *scheme;
   const char *content_type;
   g_autofree char *default_app = NULL;
   g_auto(GStrv) choices = NULL;
   guint n_choices;
 
+  open_uri = (OpenURI *)g_object_get_data (G_OBJECT (request), "open-uri");
   scheme = (const char *)g_object_get_data (G_OBJECT (request), "scheme");
   content_type = (const char *)g_object_get_data (G_OBJECT (request), "content-type");
   find_recommended_choices (scheme, content_type, &default_app, &choices, &n_choices);
 
-  xdp_dbus_impl_app_chooser_call_update_choices (impl,
+  xdp_dbus_impl_app_chooser_call_update_choices (open_uri->impl,
                                                  request->id,
                                                  (const char * const *)choices,
                                                  NULL,
@@ -592,6 +596,7 @@ handle_open_in_thread_func (GTask *task,
                             GCancellable *cancellable)
 {
   XdpRequest *request = XDP_REQUEST (task_data);
+  OpenURI *open_uri = (OpenURI *) source_object;
   const char *parent_window;
   const char *app_id = xdp_app_info_get_id (request->app_info);
   const char *activation_token;
@@ -618,6 +623,10 @@ handle_open_in_thread_func (GTask *task,
   const char *reason;
 
   REQUEST_AUTOLOCK (request);
+
+  g_object_set_data_full (G_OBJECT (request), "open-uri",
+                          g_object_ref (open_uri),
+                          g_object_unref);
 
   parent_window = (const char *)g_object_get_data (G_OBJECT (request), "parent-window");
   uri = g_strdup ((const char *)g_object_get_data (G_OBJECT (request), "uri"));
@@ -682,19 +691,14 @@ handle_open_in_thread_func (GTask *task,
       g_autofree char *path = NULL;
       gboolean fd_is_writable;
       g_autoptr(GError) local_error = NULL;
-      g_autofree char *host_path = NULL;
 
       path = xdp_app_info_get_path_for_fd (request->app_info, fd, 0, NULL, &fd_is_writable, &local_error);
 
       if (path != NULL)
         {
-          host_path = xdp_get_real_path_for_doc_path (path, request->app_info);
-          if (host_path)
-            {
-              g_debug ("OpenFile: translating path value '%s' to host path '%s'", path, host_path);
-              g_clear_pointer (&path, g_free);
-              path = g_steal_pointer (&host_path);
-            }
+          char *resolved_path = xdp_resolve_document_portal_path (path, XDP_RESOLVE_DOCUMENT_TO_FILE);
+          g_clear_pointer (&path, g_free);
+          path = g_steal_pointer (&resolved_path);
         }
 
       if (path == NULL ||
@@ -724,14 +728,17 @@ handle_open_in_thread_func (GTask *task,
 
       if (open_dir)
         {
-          g_autofree char *real_path = xdp_get_real_path_for_doc_path (path, request->app_info);
           /* Try opening the directory via the file manager interface, then
              fall back to a plain URI open */
           g_autoptr(GError) local_error = NULL;
           g_autoptr(GVariant) result = NULL;
           g_autoptr(GVariantBuilder) uris_builder = NULL;
-          g_autofree char* item_uri = g_filename_to_uri (real_path, NULL, NULL);
+          g_autofree char *item_uri = NULL;
           g_autoptr(GDBusConnection) bus = NULL;
+          g_autofree char *real_path = NULL;
+
+          real_path = xdp_resolve_document_portal_path (path, XDP_RESOLVE_DOCUMENT_TO_DIRECTORY);
+          item_uri = g_filename_to_uri (real_path, NULL, NULL);
 
           bus = g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, &local_error);
 
@@ -893,19 +900,21 @@ handle_open_in_thread_func (GTask *task,
     g_variant_builder_add (&opts_builder, "{sv}", "activation_token", g_variant_new_string (activation_token));
 
   impl_request =
-    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (impl)),
+    xdp_dbus_impl_request_proxy_new_sync (g_dbus_proxy_get_connection (G_DBUS_PROXY (open_uri->impl)),
                                           G_DBUS_PROXY_FLAGS_DO_NOT_LOAD_PROPERTIES,
-                                          g_dbus_proxy_get_name (G_DBUS_PROXY (impl)),
+                                          g_dbus_proxy_get_name (G_DBUS_PROXY (open_uri->impl)),
                                           request->id,
                                           NULL, NULL);
 
   xdp_request_set_impl_request (request, impl_request);
 
-  g_signal_connect_object (monitor, "changed", G_CALLBACK (app_info_changed), request, 0);
+  g_signal_connect_object (open_uri->monitor, "changed",
+                           G_CALLBACK (on_app_info_changed),
+                           request, G_CONNECT_DEFAULT);
 
   g_debug ("Opening app chooser");
 
-  xdp_dbus_impl_app_chooser_call_choose_application (impl,
+  xdp_dbus_impl_app_chooser_call_choose_application (open_uri->impl,
                                                      request->id,
                                                      app_id,
                                                      parent_window,
@@ -948,13 +957,14 @@ handle_open_uri (XdpDbusOpenURI *object,
                  const gchar *arg_uri,
                  GVariant *arg_options)
 {
+  OpenURI *open_uri = (OpenURI *) object;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   g_autoptr(GTask) task = NULL;
   gboolean writable;
   gboolean ask;
   const char *activation_token = NULL;
 
-  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (open_uri->lockdown_impl))
     {
       g_debug ("Application handlers disabled");
       g_dbus_method_invocation_return_error (invocation,
@@ -984,7 +994,8 @@ handle_open_uri (XdpDbusOpenURI *object,
   xdp_request_export (request, g_dbus_method_invocation_get_connection (invocation));
   xdp_dbus_open_uri_complete_open_uri (object, invocation, request->id);
 
-  task = g_task_new (object, NULL, NULL, NULL);
+  task = g_task_new (open_uri, NULL, NULL, NULL);
+  g_task_set_source_tag (task, handle_open_uri);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_open_in_thread_func);
 
@@ -999,15 +1010,16 @@ handle_open_file (XdpDbusOpenURI *object,
                  GVariant *arg_fd,
                  GVariant *arg_options)
 {
+  OpenURI *open_uri = (OpenURI *) object;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   g_autoptr(GTask) task = NULL;
   gboolean writable;
   gboolean ask;
-  int fd_id, fd;
+  g_autofd int fd = -1;
   const char *activation_token = NULL;
   g_autoptr(GError) error = NULL;
 
-  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (open_uri->lockdown_impl))
     {
       g_debug ("Application handlers disabled");
       g_dbus_method_invocation_return_error (invocation,
@@ -1023,18 +1035,8 @@ handle_open_file (XdpDbusOpenURI *object,
   if (!g_variant_lookup (arg_options, "ask", "b", &ask))
     ask = FALSE;
 
-  g_variant_get (arg_fd, "h", &fd_id);
-  if (fd_id >= g_unix_fd_list_get_length (fd_list))
-    {
-      g_dbus_method_invocation_return_error (invocation,
-                                             XDG_DESKTOP_PORTAL_ERROR,
-                                             XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
-                                             "Bad file descriptor index");
-      return G_DBUS_METHOD_INVOCATION_HANDLED;
-    }
-
-  fd = g_unix_fd_list_get (fd_list, fd_id, &error);
-  if (fd == -1)
+  fd = xdp_get_portal_call_fd (fd_list, g_variant_get_handle (arg_fd), &error);
+  if (fd < 0)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -1042,7 +1044,7 @@ handle_open_file (XdpDbusOpenURI *object,
 
   g_variant_lookup (arg_options, "activation_token", "&s", &activation_token);
 
-  g_object_set_data (G_OBJECT (request), "fd", GINT_TO_POINTER (fd));
+  g_object_set_data (G_OBJECT (request), "fd", GINT_TO_POINTER (g_steal_fd (&fd)));
   g_object_set_data_full (G_OBJECT (request), "parent-window", g_strdup (arg_parent_window), g_free);
   g_object_set_data (G_OBJECT (request), "writable", GINT_TO_POINTER (writable));
   g_object_set_data (G_OBJECT (request), "ask", GINT_TO_POINTER (ask));
@@ -1054,6 +1056,7 @@ handle_open_file (XdpDbusOpenURI *object,
   xdp_dbus_open_uri_complete_open_file (object, invocation, NULL, request->id);
 
   task = g_task_new (object, NULL, NULL, NULL);
+  g_task_set_source_tag (task, handle_open_file);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_open_in_thread_func);
 
@@ -1068,13 +1071,14 @@ handle_open_directory (XdpDbusOpenURI *object,
                        GVariant *arg_fd,
                        GVariant *arg_options)
 {
+  OpenURI *open_uri = (OpenURI *) object;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   g_autoptr(GTask) task = NULL;
-  int fd_id, fd;
+  g_autofd int fd = -1;
   const char *activation_token = NULL;
   g_autoptr(GError) error = NULL;
 
-  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_application_handlers (open_uri->lockdown_impl))
     {
       g_debug ("Application handlers disabled");
       g_dbus_method_invocation_return_error (invocation,
@@ -1084,18 +1088,8 @@ handle_open_directory (XdpDbusOpenURI *object,
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
-  g_variant_get (arg_fd, "h", &fd_id);
-  if (fd_id >= g_unix_fd_list_get_length (fd_list))
-    {
-      g_dbus_method_invocation_return_error (invocation,
-                                             XDG_DESKTOP_PORTAL_ERROR,
-                                             XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
-                                             "Bad file descriptor index");
-      return G_DBUS_METHOD_INVOCATION_HANDLED;
-    }
-
-  fd = g_unix_fd_list_get (fd_list, fd_id, &error);
-  if (fd == -1)
+  fd = xdp_get_portal_call_fd (fd_list, g_variant_get_handle (arg_fd), &error);
+  if (fd < 0)
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -1103,7 +1097,7 @@ handle_open_directory (XdpDbusOpenURI *object,
 
   g_variant_lookup (arg_options, "activation_token", "&s", &activation_token);
 
-  g_object_set_data (G_OBJECT (request), "fd", GINT_TO_POINTER (fd));
+  g_object_set_data (G_OBJECT (request), "fd", GINT_TO_POINTER (g_steal_fd (&fd)));
   g_object_set_data_full (G_OBJECT (request), "parent-window", g_strdup (arg_parent_window), g_free);
   g_object_set_data (G_OBJECT (request), "writable", GINT_TO_POINTER (0));
   g_object_set_data (G_OBJECT (request), "ask", GINT_TO_POINTER (0));
@@ -1116,6 +1110,7 @@ handle_open_directory (XdpDbusOpenURI *object,
   xdp_dbus_open_uri_complete_open_directory (object, invocation, NULL, request->id);
 
   task = g_task_new (object, NULL, NULL, NULL);
+  g_task_set_source_tag (task, handle_open_directory);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, handle_open_in_thread_func);
 
@@ -1132,42 +1127,80 @@ open_uri_iface_init (XdpDbusOpenURIIface *iface)
 }
 
 static void
+open_uri_dispose (GObject *object)
+{
+  OpenURI *openuri = (OpenURI *) object;
+
+  g_clear_object (&openuri->impl);
+  g_clear_object (&openuri->lockdown_impl);
+  g_clear_object (&openuri->monitor);
+
+  G_OBJECT_CLASS (open_uri_parent_class)->dispose (object);
+}
+
+static void
 open_uri_init (OpenURI *openuri)
 {
-  xdp_dbus_open_uri_set_version (XDP_DBUS_OPEN_URI (openuri), 5);
 }
 
 static void
 open_uri_class_init (OpenURIClass *klass)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->dispose = open_uri_dispose;
 }
 
-GDBusInterfaceSkeleton *
-open_uri_create (GDBusConnection *connection,
-                 const char *dbus_name,
-                 gpointer lockdown_proxy)
+static OpenURI *
+open_uri_new (XdpDbusImplAppChooser *app_chooser_impl,
+              XdpDbusImplLockdown   *lockdown_impl)
 {
+  OpenURI *open_uri;
+
+  open_uri = g_object_new (open_uri_get_type (), NULL);
+  open_uri->impl = g_object_ref (app_chooser_impl);
+  open_uri->lockdown_impl = g_object_ref (lockdown_impl);
+  open_uri->monitor = g_app_info_monitor_get ();
+
+  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (open_uri->impl),
+                                    G_MAXINT);
+
+  xdp_dbus_open_uri_set_version (XDP_DBUS_OPEN_URI (open_uri), 5);
+
+  return open_uri;
+}
+
+void
+init_open_uri (XdpContext *context)
+{
+  g_autoptr(OpenURI) open_uri = NULL;
+  GDBusConnection *connection = xdp_context_get_connection (context);
+  XdpPortalConfig *config = xdp_context_get_config (context);
+  XdpImplConfig *impl_config;
+  g_autoptr(XdpDbusImplAppChooser) impl = NULL;
+  XdpDbusImplLockdown *lockdown_impl;
   g_autoptr(GError) error = NULL;
 
-  lockdown = lockdown_proxy;
+  impl_config = xdp_portal_config_find (config, APP_CHOOSER_DBUS_IMPL_IFACE);
+  if (impl_config == NULL)
+    return;
 
   impl = xdp_dbus_impl_app_chooser_proxy_new_sync (connection,
                                                    G_DBUS_PROXY_FLAGS_NONE,
-                                                   dbus_name,
-                                                   DESKTOP_PORTAL_OBJECT_PATH,
+                                                   impl_config->dbus_name,
+                                                   DESKTOP_DBUS_PATH,
                                                    NULL, &error);
   if (impl == NULL)
     {
       g_warning ("Failed to create app chooser proxy: %s", error->message);
-      return NULL;
+      return;
     }
 
-  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (impl), G_MAXINT);
+  lockdown_impl = xdp_context_get_lockdown_impl (context);
 
-  open_uri = g_object_new (open_uri_get_type (), NULL);
+  open_uri = open_uri_new (impl, lockdown_impl);
 
-  monitor = g_app_info_monitor_get ();
-
-  return G_DBUS_INTERFACE_SKELETON (open_uri);
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&open_uri)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }
-

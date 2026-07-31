@@ -22,86 +22,41 @@
 
 #include "config.h"
 
-#include <json-glib/json-glib.h>
+#include "xdp-utils.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/random.h>
 
 #include <gio/gio.h>
 #include <gio/gunixoutputstream.h>
+#include <json-glib/json-glib.h>
+#include <sys/ioctl.h>
 
-#include "xdp-utils.h"
+#include "xdp-types.h"
 
-#define DBUS_NAME_DBUS "org.freedesktop.DBus"
-#define DBUS_INTERFACE_DBUS DBUS_NAME_DBUS
-#define DBUS_PATH_DBUS "/org/freedesktop/DBus"
+#if HAVE_PIDFD_OPEN
+#include <sys/pidfd.h>
+#else
+#include <unistd.h>
 
-/* Based on g_mkstemp from glib */
-gint
-xdp_mkstempat (int    dir_fd,
-               gchar *tmpl,
-               int    flags,
-               int    mode)
+#include <sys/syscall.h>
+#endif
+
+#define PIDFS_IOCTL_MAGIC 0xFF
+#define PIDFD_GET_PID_NAMESPACE _IO(PIDFS_IOCTL_MAGIC, 5)
+
+#if !HAVE_PIDFD_OPEN
+static int
+pidfd_open (pid_t        pid,
+            unsigned int flags)
 {
-  char *XXXXXX;
-  int count, fd;
-  static const char letters[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-  static const int NLETTERS = sizeof (letters) - 1;
-  gint64 value;
-  gint64 current_time;
-  static int counter = 0;
-
-  g_return_val_if_fail (tmpl != NULL, -1);
-
-  /* find the last occurrence of "XXXXXX" */
-  XXXXXX = g_strrstr (tmpl, "XXXXXX");
-
-  if (!XXXXXX || strncmp (XXXXXX, "XXXXXX", 6))
-    {
-      errno = EINVAL;
-      return -1;
-    }
-
-  /* Get some more or less random data.  */
-  current_time = g_get_real_time ();
-  value = ((current_time % G_USEC_PER_SEC) ^ (current_time / G_USEC_PER_SEC)) + counter++;
-
-  for (count = 0; count < 100; value += 7777, ++count)
-    {
-      gint64 v = value;
-
-      /* Fill in the random bits.  */
-      XXXXXX[0] = letters[v % NLETTERS];
-      v /= NLETTERS;
-      XXXXXX[1] = letters[v % NLETTERS];
-      v /= NLETTERS;
-      XXXXXX[2] = letters[v % NLETTERS];
-      v /= NLETTERS;
-      XXXXXX[3] = letters[v % NLETTERS];
-      v /= NLETTERS;
-      XXXXXX[4] = letters[v % NLETTERS];
-      v /= NLETTERS;
-      XXXXXX[5] = letters[v % NLETTERS];
-
-      fd = openat (dir_fd, tmpl, flags | O_CREAT | O_EXCL, mode);
-
-      if (fd >= 0)
-        return fd;
-      else if (errno != EEXIST)
-        /* Any other error will apply also to other names we might
-         *  try, and there are 2^32 or so of them, so give up now.
-         */
-        return -1;
-    }
-
-  /* We got out of the loop because we ran out of combinations to try.  */
-  errno = EEXIST;
-  return -1;
+   return syscall (SYS_pidfd_open, pid, flags);
 }
+#endif
 
 static gboolean
 needs_quoting (const char *arg)
@@ -119,6 +74,12 @@ needs_quoting (const char *arg)
   return FALSE;
 }
 
+typedef struct
+{
+  XdpPeerDisconnectCallback peer_disconnect_cb;
+  gpointer user_data;
+} PeerDisconnectData;
+
 static void
 name_owner_changed (GDBusConnection *connection,
                     const gchar     *sender_name,
@@ -128,43 +89,187 @@ name_owner_changed (GDBusConnection *connection,
                     GVariant        *parameters,
                     gpointer         user_data)
 {
+  PeerDisconnectData *data = user_data;
   const char *name, *from, *to;
-  XdpPeerDiedCallback peer_died_cb = user_data;
 
-  if (!peer_died_cb)
+  if (!data->peer_disconnect_cb)
     return;
 
   g_variant_get (parameters, "(&s&s&s)", &name, &from, &to);
 
   if (name[0] != ':' ||
-      strcmp (name, from) != 0 ||
-      strcmp (to, "") != 0)
+      g_strcmp0 (name, from) != 0 ||
+      g_strcmp0 (to, "") != 0)
     return;
 
-  peer_died_cb (name);
+  data->peer_disconnect_cb (name, data->user_data);
+}
+
+guint
+xdp_connection_track_peer_disconnect (GDBusConnection           *connection,
+                                      XdpPeerDisconnectCallback  peer_disconnect_cb,
+                                      gpointer                   user_data)
+{
+  PeerDisconnectData *data = g_new0 (PeerDisconnectData, 1);
+
+  data->peer_disconnect_cb = peer_disconnect_cb;
+  data->user_data = user_data;
+
+  return g_dbus_connection_signal_subscribe (connection,
+                                             DBUS_DBUS_NAME,
+                                             DBUS_DBUS_IFACE,
+                                             "NameOwnerChanged",
+                                             DBUS_DBUS_PATH,
+                                             NULL,
+                                             G_DBUS_SIGNAL_FLAGS_NONE,
+                                             name_owner_changed,
+                                             g_steal_pointer (&data),
+                                             g_free);
 }
 
 void
-xdp_connection_track_name_owners (GDBusConnection     *connection,
-                                  XdpPeerDiedCallback  peer_died_cb)
+xdp_connection_untrack_peer_disconnect (GDBusConnection *connection,
+                                        guint            subscription_id)
 {
-  g_dbus_connection_signal_subscribe (connection,
-                                      DBUS_NAME_DBUS,
-                                      DBUS_INTERFACE_DBUS,
-                                      "NameOwnerChanged",
-                                      DBUS_PATH_DBUS,
-                                      NULL,
-                                      G_DBUS_SIGNAL_FLAGS_NONE,
-                                      name_owner_changed,
-                                      peer_died_cb, NULL);
+  g_dbus_connection_signal_unsubscribe (connection, subscription_id);
+}
+
+static gboolean
+xdp_connection_get_pid_legacy (GDBusConnection  *connection,
+                               const char       *sender,
+                               GCancellable     *cancellable,
+                               int              *out_pidfd,
+                               uint32_t         *out_pid,
+                               GError          **error)
+{
+  g_autoptr(GVariant) reply = NULL;
+
+  reply = g_dbus_connection_call_sync (connection,
+                                       DBUS_DBUS_NAME,
+                                       DBUS_DBUS_PATH,
+                                       DBUS_DBUS_IFACE,
+                                       "GetConnectionUnixProcessID",
+                                       g_variant_new ("(s)", sender),
+                                       G_VARIANT_TYPE ("(u)"),
+                                       G_DBUS_CALL_FLAGS_NONE,
+                                       30000,
+                                       cancellable,
+                                       error);
+  if (!reply)
+    return FALSE;
+
+  *out_pidfd = -1;
+  g_variant_get (reply, "(u)", out_pid);
+  return TRUE;
 }
 
 gboolean
-xdp_filter_options (GVariant *options,
-                    GVariantBuilder *filtered,
-                    const XdpOptionKey *supported_options,
-                    int n_supported_options,
-                    GError **error)
+xdp_connection_get_pidfd_sync (GDBusConnection  *connection,
+                               const char       *sender,
+                               GCancellable     *cancellable,
+                               int              *out_pidfd,
+                               uint32_t         *out_pid,
+                               GError          **error)
+{
+  g_autoptr(GVariant) reply = NULL;
+  g_autoptr(GVariant) dict = NULL;
+  g_autoptr(GError) local_error = NULL;
+  g_autoptr(GVariant) process_fd = NULL;
+  g_autoptr(GVariant) process_id = NULL;
+  uint32_t pid;
+  int fd_id;
+  g_autoptr(GUnixFDList) fd_list = NULL;
+  g_autofd int pidfd = -1;
+
+  reply = g_dbus_connection_call_with_unix_fd_list_sync (connection,
+                                                         DBUS_DBUS_NAME,
+                                                         DBUS_DBUS_PATH,
+                                                         DBUS_DBUS_IFACE,
+                                                         "GetConnectionCredentials",
+                                                         g_variant_new ("(s)", sender),
+                                                         G_VARIANT_TYPE ("(a{sv})"),
+                                                         G_DBUS_CALL_FLAGS_NONE,
+                                                         30000,
+                                                         NULL,
+                                                         &fd_list,
+                                                         cancellable,
+                                                         &local_error);
+
+  if (!reply)
+    {
+      if (g_error_matches (local_error, G_DBUS_ERROR, G_DBUS_ERROR_UNKNOWN_INTERFACE))
+        {
+          return xdp_connection_get_pid_legacy (connection,
+                                                sender,
+                                                cancellable,
+                                                out_pidfd,
+                                                out_pid,
+                                                error);
+        }
+
+      g_propagate_error (error, g_steal_pointer (&local_error));
+      return FALSE;
+    }
+
+  g_variant_get (reply, "(@a{sv})", &dict);
+
+  process_id = g_variant_lookup_value (dict, "ProcessID", G_VARIANT_TYPE_UINT32);
+  if (!process_id)
+    {
+      return xdp_connection_get_pid_legacy (connection,
+                                            sender,
+                                            cancellable,
+                                            out_pidfd,
+                                            out_pid,
+                                            error);
+    }
+
+  pid = g_variant_get_uint32 (process_id);
+
+  process_fd = g_variant_lookup_value (dict, "ProcessFD", G_VARIANT_TYPE_HANDLE);
+  if (!process_fd)
+    {
+      *out_pidfd = -1;
+      *out_pid = pid;
+      return TRUE;
+    }
+
+  fd_id = g_variant_get_handle (process_fd);
+
+  if (fd_list == NULL)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Can't find peer pidfd");
+      return FALSE;
+    }
+
+  if (!xdp_is_fd_list_index_valid (fd_list, fd_id))
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED, "Pidfd index is out of bounds");
+      return FALSE;
+    }
+
+  pidfd = g_unix_fd_list_get (fd_list, fd_id, error);
+  if (pidfd < 0)
+    return FALSE;
+
+  *out_pidfd = g_steal_fd (&pidfd);
+  *out_pid = pid;
+  return TRUE;
+}
+
+XdpAppInfo *
+xdp_invocation_get_app_info (GDBusMethodInvocation *invocation)
+{
+  return g_object_get_data (G_OBJECT (invocation), "xdp-app-info");
+}
+
+gboolean
+xdp_filter_options (GVariant            *options,
+                    GVariantBuilder     *filtered,
+                    const XdpOptionKey  *supported_options,
+                    int                  n_supported_options,
+                    gpointer             user_data,
+                    GError             **error)
 {
   int i;
   gboolean ret = TRUE;
@@ -197,7 +302,11 @@ xdp_filter_options (GVariant *options,
         {
           g_autoptr(GError) local_error = NULL;
 
-          if (!supported_options[i].validate (supported_options[i].key, value, options, &local_error))
+          if (!supported_options[i].validate (supported_options[i].key,
+                                              value,
+                                              options,
+                                              user_data,
+                                              &local_error))
             {
               if (error && *error == NULL)
                 g_propagate_error (error, g_steal_pointer (&local_error));
@@ -240,8 +349,7 @@ static char *documents_mountpoint = NULL;
 void
 xdp_set_documents_mountpoint (const char *path)
 {
-  g_clear_pointer (&documents_mountpoint, g_free);
-  documents_mountpoint = g_strdup (path);
+  g_set_str (&documents_mountpoint, path);
 }
 
 const char *
@@ -339,6 +447,23 @@ xdp_is_valid_app_id (const char *string)
   return TRUE;
 }
 
+gboolean
+xdp_is_valid_token (const char *string)
+{
+  g_autofree char *path = NULL;
+  int i;
+
+  for (i = 0; string[i]; i++)
+    {
+      if (G_UNLIKELY (!is_valid_name_character (string[i], FALSE)))
+        return FALSE;
+    }
+
+  path = g_strdup_printf ("/foo/%s", string);
+
+  return g_variant_is_object_path (path);
+}
+
 char *
 xdp_get_app_id_from_desktop_id (const char *desktop_id)
 {
@@ -380,7 +505,7 @@ xdp_maybe_quote_argv (const char *argv[],
         g_string_append (res, argv[i]);
     }
 
-  return g_string_free (res, FALSE);
+  return g_string_free_and_steal (res);
 }
 
 typedef struct
@@ -426,7 +551,7 @@ xdp_spawn (GError     **error,
            const char  *argv0,
            ...)
 {
-  GPtrArray *args;
+  g_autoptr(GPtrArray) args = NULL;
   const char *arg;
   va_list ap;
   char *output;
@@ -440,8 +565,6 @@ xdp_spawn (GError     **error,
   va_end (ap);
 
   output = xdp_spawn_full ((const char * const *) args->pdata, -1, -1, error);
-
-  g_ptr_array_free (args, TRUE);
 
   return output;
 }
@@ -514,6 +637,21 @@ xdp_spawn_full (const char * const  *argv,
     }
 
   return NULL;
+}
+
+gboolean
+xdp_is_valid_filename (const char *filename)
+{
+  if (*filename == '\0')
+    return FALSE;
+
+  if (strcmp (filename, ".") == 0 || strcmp (filename, "..") == 0)
+    return FALSE;
+
+  if (strchr (filename, '/') != NULL)
+    return FALSE;
+
+  return TRUE;
 }
 
 char *
@@ -716,6 +854,27 @@ xdp_variant_contains_key (GVariant *dictionary,
   return FALSE;
 }
 
+gboolean
+xdp_pid_to_pidfd (pid_t    pid,
+                  int     *pidfd_out,
+                  GError **error)
+{
+  g_autofd int pidfd = -1;
+
+  pidfd = pidfd_open (pid, 0);
+
+  if (pidfd < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "Unable to pidfd from pid %d: %s", pid, g_strerror (errno));
+      return FALSE;
+    }
+
+  if (pidfd_out)
+    *pidfd_out = g_steal_fd (&pidfd);
+  return TRUE;
+}
+
 static int
 parse_pid (const char *str,
            pid_t      *pid)
@@ -860,25 +1019,6 @@ open_fdinfo_dir (GError **error)
   return fd;
 }
 
-pid_t
-xdp_pidfd_to_pid (int      pidfd,
-                  GError **error)
-{
-  int fdinfo = -1;
-  pid_t pid;
-
-  g_return_val_if_fail (pidfd >= 0, -1);
-
-  fdinfo = open_fdinfo_dir (error);
-  if (fdinfo == -1)
-    return -1;
-
-  pid = pidfd_to_pid (fdinfo, pidfd, error);
-  (void) close (fdinfo);
-
-  return pid;
-}
-
 gboolean
 xdp_pidfds_to_pids (const int  *pidfds,
                     pid_t      *pids,
@@ -908,17 +1048,52 @@ xdp_pidfds_to_pids (const int  *pidfds,
 }
 
 gboolean
-xdp_pidfd_get_namespace (int      pidfd,
+xdp_pidfd_get_pidns (int      pidfd,
+                     ino_t   *ns,
+                     GError **error)
+{
+  g_autofd int pidns_fd = -1;
+  struct stat st;
+
+  g_return_val_if_fail (pidfd >= 0, FALSE);
+  g_return_val_if_fail (ns != NULL, FALSE);
+
+  pidns_fd = ioctl (pidfd, PIDFD_GET_PID_NAMESPACE, 0);
+  if (pidns_fd < 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "PIDFD_GET_PID_NAMESPACE ioctl failed: %s",
+                   g_strerror (errno));
+      return FALSE;
+    }
+
+  if (fstat (pidns_fd, &st) != 0)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "fstat on pidns fd failed: %s",
+                   g_strerror (errno));
+      return FALSE;
+    }
+
+  /* The inode number (together with the device ID) encode
+   * the identity of the pid namespace, see namespaces(7)
+   */
+  *ns = st.st_ino;
+  return TRUE;
+}
+
+static gboolean
+xdp_pid_dirfd_get_pidns (int      pid_dirfd,
                          ino_t   *ns,
                          GError **error)
 {
   struct stat st;
   int r;
 
-  g_return_val_if_fail (pidfd >= 0, FALSE);
+  g_return_val_if_fail (pid_dirfd >= 0, FALSE);
   g_return_val_if_fail (ns != NULL, FALSE);
 
-  r = fstatat (pidfd, "ns/pid", &st, 0);
+  r = fstatat (pid_dirfd, "ns/pid", &st, 0);
   if (r == -1)
     {
       g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
@@ -966,7 +1141,7 @@ parse_status_field_uid (const char *val,
 }
 
 static int
-parse_status_file (int    pid_fd,
+parse_status_file (int    pid_dirfd,
                    pid_t *pid_out,
                    uid_t *uid_out)
 {
@@ -981,9 +1156,9 @@ parse_status_file (int    pid_fd,
   int fd;
   int r = 0;
 
-  g_return_val_if_fail (pid_fd > -1, FALSE);
+  g_return_val_if_fail (pid_dirfd > -1, FALSE);
 
-  fd = openat (pid_fd, "status",  O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  fd = openat (pid_dirfd, "status",  O_RDONLY | O_CLOEXEC | O_NOCTTY);
   if (fd == -1)
     return -errno;
 
@@ -1074,7 +1249,7 @@ xdp_map_pids_full (DIR     *proc,
 
   while ((de = readdir (proc)) != NULL)
     {
-      g_autofd int pid_fd = -1;
+      g_autofd int pid_dirfd = -1;
       pid_t outside = 0;
       pid_t inside = 0;
       uid_t uid = 0;
@@ -1085,11 +1260,12 @@ xdp_map_pids_full (DIR     *proc,
       if (de->d_type != DT_DIR)
         continue;
 
-      pid_fd = openat (dirfd (proc), de->d_name, O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOCTTY);
-      if (pid_fd == -1)
+      pid_dirfd = openat (dirfd (proc), de->d_name,
+                          O_RDONLY | O_NONBLOCK | O_DIRECTORY | O_CLOEXEC | O_NOCTTY);
+      if (pid_dirfd == -1)
         continue;
 
-      if (!xdp_pidfd_get_namespace (pid_fd, &ns, NULL))
+      if (!xdp_pid_dirfd_get_pidns (pid_dirfd, &ns, NULL))
         continue;
 
       if (pidns != ns)
@@ -1099,7 +1275,7 @@ xdp_map_pids_full (DIR     *proc,
       if (r < 0)
         continue;
 
-      r = parse_status_file (pid_fd, &inside, &uid);
+      r = parse_status_file (pid_dirfd, &inside, &uid);
       if (r < 0)
         continue;
 
@@ -1198,4 +1374,116 @@ xdp_map_tids (ino_t    pidns,
   proc_dir = g_strdup_printf ("/proc/%u/task", (guint) owner_pid);
 
   return map_pids_proc (pidns, tids, n_tids, proc_dir, error);
+}
+
+int
+xdp_get_portal_call_fd (GUnixFDList  *fd_list,
+                        int           fd_id,
+                        GError      **error)
+{
+  g_autofd int fd = -1;
+  g_autoptr(GError) local_error = NULL;
+
+  if (!xdp_is_fd_list_index_valid (fd_list, fd_id))
+    {
+      g_set_error (error,
+                   XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                   "File descriptor index %d is out of bounds (provided %d fds)",
+                   fd_id, g_unix_fd_list_get_length (fd_list));
+      return -1;
+    }
+
+  fd = g_unix_fd_list_get (fd_list, fd_id, &local_error);
+  if (fd < 0)
+    {
+      g_set_error (error,
+                   XDG_DESKTOP_PORTAL_ERROR,
+                   XDG_DESKTOP_PORTAL_ERROR_FAILED,
+                   "Failed to get file descriptor: %s",
+                   local_error->message);
+    }
+
+  return g_steal_fd (&fd);
+}
+
+gboolean
+xdp_copy_fd_to_lists (GUnixFDList  *fd_list_src,
+                      GUnixFDList  *fd_list_dst,
+                      int           fd_id,
+                      int          *fd_id_out,
+                      GError      **error)
+{
+  g_autofd int fd = -1;
+  int new_fd_id;
+
+  if (!xdp_is_fd_list_index_valid (fd_list_src, fd_id))
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                   "File descriptor index %d is out of bounds (provided %d fds)",
+                   fd_id, g_unix_fd_list_get_length (fd_list_src));
+      return FALSE;
+    }
+
+  fd = g_unix_fd_list_get (fd_list_src, fd_id, error);
+  if (fd < 0)
+    return FALSE;
+
+  new_fd_id = g_unix_fd_list_append (fd_list_dst, fd, error);
+  if (new_fd_id < 0)
+    return FALSE;
+
+  if (fd_id_out)
+    *fd_id_out = new_fd_id;
+
+  return TRUE;
+}
+
+/* Encode bytes as D-Bus-path-safe base64 ([A-Za-z0-9_], no padding).
+ * We alias + and / to _ but that barely affects the information encoded. */
+static char *
+encode_base64_for_dbus (const uint8_t *data,
+                        size_t         len)
+{
+  g_autofree char *encoded = g_base64_encode (data, len);
+
+  for (size_t i = 0; encoded[i]; i++)
+    {
+      if (encoded[i] == '=')
+        {
+          encoded[i] = '\0';
+          break;
+        }
+
+      if (encoded[i] == '+' || encoded[i] == '/')
+        encoded[i] = '_';
+    }
+
+  return g_steal_pointer (&encoded);
+}
+
+char *
+xdp_generate_token (void)
+{
+  uint32_t rng[4];
+
+  for (size_t i = 0; i < G_N_ELEMENTS (rng); i++)
+    rng[i] = g_random_int ();
+
+  return encode_base64_for_dbus ((const uint8_t *) rng, sizeof (rng));
+}
+
+char *
+xdp_generate_key (GError **error)
+{
+  uint8_t key[16];
+
+  if (getrandom (key, sizeof (key), 0) != sizeof (key))
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
+                   "Failed to get random data: %s", g_strerror (errno));
+      return NULL;
+    }
+
+  return encode_base64_for_dbus (key, sizeof (key));
 }

@@ -3,7 +3,7 @@
 # This file is formatted with Python Black
 # mypy: disable-error-code="misc"
 
-from tests.templates import Response, init_logger, ImplRequest, ImplSession
+from tests.templates.xdp_utils import Response, init_logger, ImplRequest, ImplSession
 
 import dbus
 import dbus.service
@@ -17,7 +17,7 @@ BUS_NAME = "org.freedesktop.impl.portal.Test"
 MAIN_OBJ = "/org/freedesktop/portal/desktop"
 SYSTEM_BUS = False
 MAIN_IFACE = "org.freedesktop.impl.portal.GlobalShortcuts"
-VERSION = 1
+VERSION = 2
 
 
 logger = init_logger(__name__)
@@ -140,6 +140,15 @@ def ListShortcuts(
 ):
     shortcuts = self.sessions[session_handle].shortcuts
     return (0, {"shortcuts": shortcuts})
+
+
+@dbus.service.method(
+    MAIN_IFACE,
+    in_signature="osa{sv}",
+    out_signature="",
+)
+def ConfigureShortcuts(self, session_handle, parent_window, options):
+    assert session_handle in self.sessions
 
 
 @dbus.service.method(

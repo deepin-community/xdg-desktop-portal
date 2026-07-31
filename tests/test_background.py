@@ -2,7 +2,7 @@
 #
 # This file is formatted with Python Black
 
-import tests as xdp
+import tests.xdp_utils as xdp
 
 import dbus
 import pytest
@@ -38,7 +38,8 @@ class TestBackground:
     def test_version(self, portals, dbus_con):
         xdp.check_version(dbus_con, "Background", 2)
 
-    def test_request_background(self, portals, dbus_con, app_id):
+    def test_request_background(self, portals, dbus_con, xdp_app_info):
+        app_id = xdp_app_info.app_id
         background_intf = xdp.get_portal_iface(dbus_con, "Background")
         desktop_file = self.get_autostart_path(app_id)
 
@@ -61,7 +62,8 @@ class TestBackground:
 
         assert not desktop_file.exists()
 
-    def test_autostart_desktopfile(self, portals, dbus_con, app_id):
+    def test_autostart_desktopfile(self, portals, dbus_con, xdp_app_info):
+        app_id = xdp_app_info.app_id
         background_intf = xdp.get_portal_iface(dbus_con, "Background")
 
         reason = "Testing portals"
@@ -83,18 +85,34 @@ class TestBackground:
         )
 
         assert response
+
+        # Unsupported on snap and linyaps
+        if isinstance(xdp_app_info, (xdp.AppInfoSnap, xdp.AppInfoLinyaps)):
+            assert response.response == 2
+            assert not response.results["autostart"]
+            return
+
         assert response.response == 0
         assert response.results["background"]
-        assert response.results["autostart"]
 
+        gapp_info = xdp_app_info.gapp_info()
+        autostart_name = gapp_info.get_name() if gapp_info else app_id
+
+        assert response.results["autostart"]
         keyfile = self.get_autostart_keyfile(app_id)
         assert keyfile.get_string("Desktop Entry", "Type") == "Application"
-        assert keyfile.get_string("Desktop Entry", "Name") == app_id
+        assert keyfile.get_string("Desktop Entry", "Name") == autostart_name
         assert keyfile.get_string("Desktop Entry", "X-XDP-Autostart") == app_id
-        assert keyfile.get_string("Desktop Entry", "Exec") == "/bin/true test"
         assert keyfile.get_boolean("Desktop Entry", "DBusActivatable")
 
-    def test_autostart_disable(self, portals, dbus_con, app_id):
+        exec = keyfile.get_string("Desktop Entry", "Exec")
+        if isinstance(xdp_app_info, xdp.AppInfoFlatpak):
+            assert exec == f"flatpak run --command=/bin/true {app_id} test"
+        else:
+            assert exec == "/bin/true test"
+
+    def test_autostart_disable(self, portals, dbus_con, xdp_app_info):
+        app_id = xdp_app_info.app_id
         background_intf = xdp.get_portal_iface(dbus_con, "Background")
         desktop_file = self.get_autostart_path(app_id)
 
@@ -113,6 +131,13 @@ class TestBackground:
         )
 
         assert response
+
+        # Unsupported on snap and linyaps
+        if isinstance(xdp_app_info, (xdp.AppInfoSnap, xdp.AppInfoLinyaps)):
+            assert response.response == 2
+            assert not response.results["autostart"]
+            return
+
         assert response.response == 0
         assert response.results["background"]
         assert response.results["autostart"]
@@ -136,7 +161,7 @@ class TestBackground:
 
         assert not desktop_file.exists()
 
-    def test_long_reason(self, portals, dbus_con, app_id):
+    def test_long_reason(self, portals, dbus_con):
         background_intf = xdp.get_portal_iface(dbus_con, "Background")
 
         reason = (

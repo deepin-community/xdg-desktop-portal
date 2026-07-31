@@ -24,6 +24,8 @@
 
 #include <gio/gio.h>
 
+#include "xdp-types.h"
+
 typedef enum {
   XDP_DOCUMENT_FLAG_NONE      = 0,
   XDP_DOCUMENT_FLAG_FOR_SAVE  = (1 << 0),
@@ -40,7 +42,12 @@ char *xdp_register_document (const char        *uri,
                              XdpDocumentFlags   flags,
                              GError           **error);
 
-char *xdp_get_real_path_for_doc_path (const char *path,
-                                      XdpAppInfo *app_info);
-
 char *xdp_get_real_path_for_doc_id (const char *doc_id);
+
+typedef enum {
+  XDP_RESOLVE_DOCUMENT_TO_FILE,
+  XDP_RESOLVE_DOCUMENT_TO_DIRECTORY
+} XdpResolveDocumentStrategy;
+
+char * xdp_resolve_document_portal_path (const char                 *path,
+                                         XdpResolveDocumentStrategy  strategy);

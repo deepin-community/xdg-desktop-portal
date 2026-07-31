@@ -1,7 +1,7 @@
 project(
   'xdg-desktop-portal',
   'c',
-  version: '1.20.4',
+  version: '1.22.1',
   meson_version: '>= 0.60',
   license: 'LGPL-2.0-or-later',
   default_options: [
@@ -75,6 +75,7 @@ cflags = [
     '-Wno-unused-parameter',
     '-Wno-sign-compare',
     '-Wno-missing-field-initializers',
+    '-Wswitch-enum',
 ]
 add_project_arguments(cc.get_supported_arguments(cflags), language : 'c')
 
@@ -87,34 +88,45 @@ config_h.set_quoted('LOCALEDIR', localedir)
 config_h.set_quoted('SYSCONFDIR', sysconfdir)
 config_h.set_quoted('GETTEXT_PACKAGE', 'xdg-desktop-portal')
 config_h.set_quoted('PACKAGE_STRING', 'xdg-desktop-portal @0@'.format(meson.project_version()))
-if cc.has_function('renameat2')
-  config_h.set('HAVE_RENAMEAT2', 1)
-endif
-if cc.has_function('splice')
-  config_h.set('HAVE_SPLICE', 1)
-endif
 
-check_headers = [
+foreach ident : [
+        ['renameat2',         '''#include <stdio.h>'''],
+        ['splice',            '''#include <fcntl.h>'''],
+        ['pidfd_open',        '''#include <sys/pidfd.h>'''], # since glibc-2.36
+]
+  have = cc.has_function(ident[0], prefix: ident[1], args: '-D_GNU_SOURCE')
+  config_h.set10('HAVE_' + ident[0].to_upper(), have)
+endforeach
+
+foreach h : [
   ['sys/vfs.h', 'HAVE_SYS_VFS_H'],
   ['sys/mount.h', 'HAVE_SYS_MOUNT_H'],
   ['sys/statfs.h', 'HAVE_SYS_STATFS_H'],
   ['sys/xattr.h', 'HAVE_SYS_XATTR_H'],
   ['sys/extattr.h', 'HAVE_SYS_EXTATTR_H'],
 ]
-
-foreach h : check_headers
-  config_h.set(h.get(1), cc.has_header(h.get(0)))
+  config_h.set10(h[1], cc.has_header(h[0]))
 endforeach
 
 libglnx = subproject(
   'libglnx',
   default_options : [
+    'default_library=static',
     'warning_level=1',
     'tests=false',
   ],
 )
 
-glib_dep = dependency('glib-2.0', version: '>= 2.72')
+gvdb = subproject(
+  'gvdb',
+  default_options : [
+    'default_library=static',
+    'warning_level=1',
+    'tests=false',
+  ],
+)
+
+glib_dep = dependency('glib-2.0', version: '>= 2.76')
 gio_dep = dependency('gio-2.0')
 gio_unix_dep = dependency('gio-unix-2.0')
 json_glib_dep = dependency('json-glib-1.0')
@@ -130,7 +142,8 @@ pipewire_dep = dependency('libpipewire-0.3', version: '>= 0.2.90')
 libsystemd_dep = dependency('libsystemd', required: get_option('systemd'))
 gudev_dep = dependency('gudev-1.0', required: get_option('gudev'))
 umockdev_dep = dependency('umockdev-1.0', required: get_option('tests'))
-libglnx_dep = libglnx.get_variable('libglnx_dep')
+libglnx_dep = dependency('libglnx')
+gvdb_dep = dependency('gvdb')
 
 gst_inspect = find_program('gst-inspect-1.0', required: false)
 if gst_inspect.found()
@@ -140,9 +153,6 @@ if gst_inspect.found()
   ).returncode() == 0
 else
   have_wav_parse = false
-endif
-if have_wav_parse
-  config_h.set('HAVE_WAV_PARSE', 1)
 endif
 
 pytest = find_program('pytest-3', 'pytest', required: get_option('tests'))
@@ -165,19 +175,13 @@ if not bwrap.found()
 endif
 
 have_geoclue = geoclue_dep.found()
-if have_geoclue
-  config_h.set('HAVE_GEOCLUE', 1)
-endif
+config_h.set10('HAVE_GEOCLUE', have_geoclue)
 
 have_libsystemd = libsystemd_dep.found()
-if have_libsystemd
-  config_h.set('HAVE_LIBSYSTEMD', 1)
-endif
+config_h.set10('HAVE_LIBSYSTEMD', have_libsystemd)
 
 have_gudev = gudev_dep.found()
-if have_gudev
-  config_h.set('HAVE_GUDEV', 1)
-endif
+config_h.set10('HAVE_GUDEV', have_gudev)
 
 add_project_arguments(['-DGLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_2_72'], language: 'c')
 

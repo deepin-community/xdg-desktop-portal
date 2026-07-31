@@ -1,9 +1,47 @@
-xdg-desktop-portal (1.20.4+ds-1deepin1) unstable; urgency=medium
+xdg-desktop-portal (1.22.1+ds-1) unstable; urgency=medium
 
-  * Apply changes from 1.20.3+ds-1deepin1:
-    - zhangkun: fix: disable systemd service by default for flatpak compatibility
+  * New upstream security fix release
+    - Prevent a malicious or compromised sandboxed app from redirecting
+      drag-and-drop and copy/paste data to itself (GHSA-c5cf-79w8-pvfh)
+    - Prevent a malicious or compromised sandboxed app from gaining
+      arbitrary write access to nonexistent files outside the sandbox
+      (GHSA-cm83-2936-gxjm)
+    - Validate all App IDs in the Document Portal to prevent maliciouss
+      applications from providing a crafted App ID which causes the
+      parsing of arbitrary files on the host as GLib.KeyFile
+      (#2023 upstream)
+    - Disable PipeWire's realtime module to prevent deadlocks
+      (#2012 upstream)
 
- -- Tianyu Chen <sweetyfish@deepin.org>  Thu, 16 Apr 2026 16:29:52 +0800
+ -- Simon McVittie <smcv@debian.org>  Thu, 18 Jun 2026 11:22:44 +0100
+
+xdg-desktop-portal (1.22.0+ds-1) experimental; urgency=medium
+
+  * New upstream release
+    - Reports placeholder data for the root of the xdg-documents-portal
+      filesystem, rather than an error (Closes: #1091643)
+  * d/p/debian/allow-no-graphical-session-target.patch:
+    Add patch from Ubuntu to avoid a regression in desktop environments
+    that don't integrate with `systemd --user`.
+    Thanks to Alessandro Astone (LP: #2144855)
+  * d/watch, d/gbp.conf: Follow the 1.22.x branch
+  * Revert "d/control, d/gbp.conf: Branch for experimental"
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 08 Jun 2026 21:57:24 +0100
+
+xdg-desktop-portal (1.21.1+ds-1) experimental; urgency=medium
+
+  * New upstream development prerelease
+    - This version fixes a vulnerability in which a malicious or compromised
+      Flatpak app could send any file or directory to the trash, including
+      those outside its sandbox.
+      (GHSA-rqr9-jwwf-wxgj) (Closes: #1132958)
+  * Merge packaging from unstable
+  * Drop patches that were applied upstream
+  * Standards-Version: 4.7.4 (no changes required)
+  * Normalize formatting of packaging (debputy reformat)
+
+ -- Simon McVittie <smcv@debian.org>  Mon, 13 Apr 2026 19:08:31 +0100
 
 xdg-desktop-portal (1.20.4+ds-1) unstable; urgency=medium
 
@@ -23,6 +61,20 @@ xdg-desktop-portal (1.20.3+ds-3) unstable; urgency=medium
   * Remove Lintian override for #1115463, no longer needed
 
  -- Simon McVittie <smcv@debian.org>  Wed, 11 Mar 2026 12:28:40 +0000
+
+xdg-desktop-portal (1.21.0+ds-1) experimental; urgency=medium
+
+  * New upstream development prerelease
+  * d/control, d/gbp.conf: Branch for experimental
+  * Revert "d/gbp.conf, d/watch: Only watch for stable (even-numbered)
+    releases"
+  * d/copyright: Update
+  * d/p/tests-Skip-tests-that-need-the-documents-portal-if-FUSE-d.patch:
+    Add proposed patch to skip tests needing FUSE on buildds
+  * d/p/tests-Don-t-include-interpreter-in-non-executable-library.patch:
+    Add patch to avoid a warning from Lintian
+
+ -- Simon McVittie <smcv@debian.org>  Sat, 24 Jan 2026 22:00:08 +0000
 
 xdg-desktop-portal (1.20.3+ds-2) unstable; urgency=medium
 

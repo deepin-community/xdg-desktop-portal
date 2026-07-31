@@ -1,21 +1,22 @@
 Source: xdg-desktop-portal
+X-Style: black
 Section: admin
 Maintainer: Utopia Maintenance Team <pkg-utopia-maintainers@lists.alioth.debian.org>
 Uploaders:
  Simon McVittie <smcv@debian.org>,
 Build-Depends:
+ debhelper-compat (= 13),
  bubblewrap,
  dbus-daemon,
- debhelper-compat (= 13),
+ fuse3 <!nocheck>,
  geoclue-2.0 <!nocheck>,
  gstreamer1.0-plugins-good,
  gstreamer1.0-tools,
- fuse3 <!nocheck>,
  libcap2-bin <!nocheck>,
- libgdk-pixbuf-2.0-dev,
- libgeoclue-2-dev,
  libflatpak-dev,
  libfuse3-dev,
+ libgdk-pixbuf-2.0-dev,
+ libgeoclue-2-dev,
  libglib2.0-dev,
  libgstreamer-plugins-base1.0-dev,
  libgudev-1.0-dev,
@@ -40,7 +41,7 @@ Build-Depends-Indep:
  python3-sphinx <!nodoc>,
  python3-sphinx-copybutton <!nodoc>,
  python3-sphinxext-opengraph <!nodoc>,
-Standards-Version: 4.7.3
+Standards-Version: 4.7.4
 Homepage: https://flatpak.github.io/xdg-desktop-portal/
 Vcs-Git: https://salsa.debian.org/debian/xdg-desktop-portal.git
 Vcs-Browser: https://salsa.debian.org/debian/xdg-desktop-portal

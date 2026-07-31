@@ -23,22 +23,24 @@
 
 #include "config.h"
 
+#include "file-chooser.h"
+
+#include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
-
-#include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
+#include <sys/types.h>
 
 #include <gio/gio.h>
 
-#include "file-chooser.h"
-#include "xdp-request.h"
-#include "xdp-documents.h"
+#include "xdp-context.h"
 #include "xdp-dbus.h"
+#include "xdp-documents.h"
 #include "xdp-impl-dbus.h"
+#include "xdp-portal-config.h"
+#include "xdp-request.h"
 #include "xdp-utils.h"
 
 typedef struct _FileChooser FileChooser;
@@ -47,16 +49,15 @@ typedef struct _FileChooserClass FileChooserClass;
 struct _FileChooser
 {
   XdpDbusFileChooserSkeleton parent_instance;
+
+  XdpDbusImplFileChooser *impl;
+  XdpDbusImplLockdown *lockdown_impl;
 };
 
 struct _FileChooserClass
 {
   XdpDbusFileChooserSkeletonClass parent_class;
 };
-
-static XdpDbusImplLockdown *lockdown;
-static XdpDbusImplFileChooser *impl;
-static FileChooser *file_chooser;
 
 GType file_chooser_get_type (void) G_GNUC_CONST;
 static void file_chooser_iface_init (XdpDbusFileChooserIface *iface);
@@ -65,6 +66,8 @@ G_DEFINE_TYPE_WITH_CODE (FileChooser, file_chooser,
                          XDP_DBUS_TYPE_FILE_CHOOSER_SKELETON,
                          G_IMPLEMENT_INTERFACE (XDP_DBUS_TYPE_FILE_CHOOSER,
                                                 file_chooser_iface_init));
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC (FileChooser, g_object_unref)
 
 static void
 send_response_in_thread_func (GTask        *task,
@@ -81,9 +84,9 @@ send_response_in_thread_func (GTask        *task,
   GVariant *options;
   XdpDocumentFlags flags = XDP_DOCUMENT_FLAG_WRITABLE | XDP_DOCUMENT_FLAG_DIRECTORY;
   g_autofree char **uris = NULL;
-  GVariant *choices;
-  GVariant *current_filter;
-  GVariant *writable;
+  g_autoptr(GVariant) choices = NULL;
+  g_autoptr(GVariant) current_filter = NULL;
+  g_autoptr(GVariant) writable = NULL;
 
   REQUEST_AUTOLOCK (request);
 
@@ -155,53 +158,6 @@ out:
   g_task_return_boolean (task, TRUE);
 }
 
-/* Calling Lookup on a nonexisting path does not work, so we
- * pull the doc id out of the path manually.
- */
-static gboolean
-looks_like_document_portal_path (const char *path,
-                                 char **guessed_docid)
-{
-  const char *prefix = "/run/user/";
-  char *docid;
-  char *p, *q;
-
-  if (!g_str_has_prefix (path, prefix))
-    return FALSE;
-
-  p = strstr (path, "/doc/");
-  if (!p)
-    return FALSE;
-
-  p += strlen ("/doc/");
-  q = strchr (p, '/');
-  if (q)
-    docid = g_strndup (p, q - p);
-  else
-    docid = g_strdup (p);
-
-  if (docid[0] == '\0')
-    {
-      g_free (docid);
-      return FALSE;
-    }
-
-  *guessed_docid = docid;
-  return TRUE;
-}
-
-static char *
-get_host_folder_for_doc_id (const char *doc_id)
-{
-  g_autofree char *real_path = xdp_get_real_path_for_doc_id (doc_id);
-  g_autofree char *host_folder = NULL;
-
-  if (real_path != NULL)
-    host_folder = g_path_get_dirname (real_path);
-
-  return g_steal_pointer (&host_folder);
-}
-
 static void
 open_file_done (GObject *source,
                 GAsyncResult *result,
@@ -228,6 +184,7 @@ open_file_done (GObject *source,
     g_object_set_data_full (G_OBJECT (request), "options", g_variant_ref (options), (GDestroyNotify)g_variant_unref);
 
   task = g_task_new (NULL, NULL, NULL, NULL);
+  g_task_set_source_tag (task, open_file_done);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, send_response_in_thread_func);
 }
@@ -322,10 +279,11 @@ check_filter (GVariant *filter,
 }
 
 static gboolean
-validate_filters (const char *key,
-                  GVariant *value,
-                  GVariant *options,
-                  GError **error)
+validate_filters (const char  *key,
+                  GVariant    *value,
+                  GVariant    *options,
+                  gpointer     user_data,
+                  GError     **error)
 {
   gsize i;
 
@@ -347,10 +305,11 @@ validate_filters (const char *key,
 }
 
 static gboolean
-validate_current_filter (const char *key,
-                         GVariant *value,
-                         GVariant *options,
-                         GError **error)
+validate_current_filter (const char  *key,
+                         GVariant    *value,
+                         GVariant    *options,
+                         gpointer     user_data,
+                         GError     **error)
 {
   g_autoptr(GVariant) filters = NULL;
   gsize i, n_children;
@@ -467,7 +426,7 @@ check_choice (GVariant *choice,
           return FALSE;
         }
 
-      if (strcmp (o_id, option) == 0)
+      if (g_strcmp0 (o_id, option) == 0)
         seen_option = TRUE;
     }
 
@@ -484,10 +443,11 @@ check_choice (GVariant *choice,
 }
 
 static gboolean
-validate_choices (const char *key,
-                  GVariant *value,
-                  GVariant *options,
-                  GError **error)
+validate_choices (const char  *key,
+                  GVariant    *value,
+                  GVariant    *options,
+                  gpointer     user_data,
+                  GError     **error)
 {
   int i;
 
@@ -526,6 +486,8 @@ handle_open_file (XdpDbusFileChooser *object,
                   const gchar *arg_title,
                   GVariant *arg_options)
 {
+  FileChooser *file_chooser = (FileChooser *) object;
+  XdpDbusImplFileChooser *impl = file_chooser->impl;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   const char *app_id = xdp_app_info_get_id (request->app_info);
   g_autoptr(GError) error = NULL;
@@ -540,31 +502,22 @@ handle_open_file (XdpDbusFileChooser *object,
 
   if (!xdp_filter_options (arg_options, &options,
                            open_file_options, G_N_ELEMENTS (open_file_options),
-                           &error))
+                           NULL, &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   {
-    g_autoptr(GVariant) value =
+    g_autoptr(GVariant) current_folder =
       g_variant_lookup_value (arg_options, "current_folder", G_VARIANT_TYPE_BYTESTRING);
 
-    if (value)
+    if (current_folder)
       {
-        const char *path_from_app = g_variant_get_bytestring (value);
-        g_autofree char *host_path = g_strdup (path_from_app);
-        g_autofree char *doc_id_from_app = NULL;
-        if (looks_like_document_portal_path (host_path, &doc_id_from_app))
-          {
-            char *real_path = get_host_folder_for_doc_id (doc_id_from_app);
-            if (real_path)
-              {
-                g_free (host_path);
-                host_path = real_path;
-              }
-            g_debug ("OpenFile: translating current_folder value '%s' to host path '%s'", path_from_app, host_path);
-          }
+        const char *path_from_app = g_variant_get_bytestring (current_folder);
+        g_autofree char *host_path = xdp_resolve_document_portal_path (path_from_app,
+                                                                       XDP_RESOLVE_DOCUMENT_TO_DIRECTORY);
+
         g_variant_builder_add (&options, "{sv}", "current_folder",
                               g_variant_new_bytestring (host_path));
       }
@@ -644,6 +597,7 @@ save_file_done (GObject *source,
     g_object_set_data_full (G_OBJECT (request), "options", g_variant_ref (options), (GDestroyNotify)g_variant_unref);
 
   task = g_task_new (NULL, NULL, NULL, NULL);
+  g_task_set_source_tag (task, save_file_done);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, send_response_in_thread_func);
 }
@@ -655,6 +609,8 @@ handle_save_file (XdpDbusFileChooser *object,
                   const gchar *arg_title,
                   GVariant *arg_options)
 {
+  FileChooser *file_chooser = (FileChooser *) object;
+  XdpDbusImplFileChooser *impl = file_chooser->impl;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   const char *app_id = xdp_app_info_get_id (request->app_info);
   g_autoptr(GError) error = NULL;
@@ -664,7 +620,7 @@ handle_save_file (XdpDbusFileChooser *object,
 
   g_debug ("Handling SaveFile");
 
-  if (xdp_dbus_impl_lockdown_get_disable_save_to_disk (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_save_to_disk (file_chooser->lockdown_impl))
     {
       g_debug ("File saving disabled");
       g_dbus_method_invocation_return_error (invocation,
@@ -678,62 +634,39 @@ handle_save_file (XdpDbusFileChooser *object,
 
   if (!xdp_filter_options (arg_options, &options,
                            save_file_options, G_N_ELEMENTS (save_file_options),
-                           &error))
+                           NULL, &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
     }
 
   {
-    g_autoptr(GVariant) value = g_variant_lookup_value (arg_options,
-                                                        "current_file",
-                                                        G_VARIANT_TYPE_BYTESTRING);
+    g_autoptr(GVariant) current_file =
+      g_variant_lookup_value (arg_options, "current_file", G_VARIANT_TYPE_BYTESTRING);
 
-    if (value)
+    if (current_file)
       {
-        const char *path = g_variant_get_bytestring (value);
-        g_autofree char *host_path = xdp_get_real_path_for_doc_path (path, request->app_info);
-        g_autofree char *doc_id = NULL;
+        const char *path_from_app = g_variant_get_bytestring (current_file);
+        g_autofree char *host_path = xdp_resolve_document_portal_path (path_from_app,
+                                                                       XDP_RESOLVE_DOCUMENT_TO_FILE);
 
-        if (strcmp (path, host_path) == 0 &&
-            looks_like_document_portal_path (path, &doc_id))
-          {
-            char *real_path = xdp_get_real_path_for_doc_id (doc_id);
-
-            if (real_path)
-              {
-                g_free (host_path);
-                host_path = real_path;
-              }
-          }
-
-        g_debug ("SaveFile: translating current_file value '%s' to host path '%s'", path, host_path);
-
-        g_variant_builder_add (&options, "{sv}", "current_file", g_variant_new_bytestring (host_path));
+        g_variant_builder_add (&options, "{sv}", "current_file",
+                              g_variant_new_bytestring (host_path));
       }
   }
   {
-      g_autoptr(GVariant) value =
-        g_variant_lookup_value (arg_options, "current_folder", G_VARIANT_TYPE_BYTESTRING);
+    g_autoptr(GVariant) current_folder =
+      g_variant_lookup_value (arg_options, "current_folder", G_VARIANT_TYPE_BYTESTRING);
 
-      if (value)
-        {
-          const char *path_from_app = g_variant_get_bytestring (value);
-          g_autofree char *host_path = g_strdup (path_from_app);
-          g_autofree char *doc_id_from_app = NULL;
-          if (looks_like_document_portal_path (host_path, &doc_id_from_app))
-            {
-              char *real_path = get_host_folder_for_doc_id (doc_id_from_app);
-              if (real_path)
-                {
-                  g_free (host_path);
-                  host_path = real_path;
-                }
-              g_debug ("SaveFile: translating current_folder value '%s' to host path '%s'", path_from_app, host_path);
-            }
-          g_variant_builder_add (&options, "{sv}", "current_folder",
-                                g_variant_new_bytestring (host_path));
-        }
+    if (current_folder)
+      {
+        const char *path_from_app = g_variant_get_bytestring (current_folder);
+        g_autofree char *host_path = xdp_resolve_document_portal_path (path_from_app,
+                                                                       XDP_RESOLVE_DOCUMENT_TO_DIRECTORY);
+
+        g_variant_builder_add (&options, "{sv}", "current_folder",
+                              g_variant_new_bytestring (host_path));
+      }
   }
 
   impl_request =
@@ -768,12 +701,39 @@ handle_save_file (XdpDbusFileChooser *object,
   return G_DBUS_METHOD_INVOCATION_HANDLED;
 }
 
+static gboolean
+validate_files (const char  *key,
+                GVariant    *value,
+                GVariant    *options,
+                gpointer     user_data,
+                GError     **error)
+{
+  g_autofree const char **filenames = NULL;
+
+  g_variant_get (value, "^a&ay", &filenames);
+
+  for (size_t i = 0; filenames[i] != NULL; i++)
+    {
+      if (!xdp_is_valid_filename (filenames[i]))
+        {
+          g_set_error (error,
+                       XDG_DESKTOP_PORTAL_ERROR,
+                       XDG_DESKTOP_PORTAL_ERROR_INVALID_ARGUMENT,
+                       "invalid filename: \"%s\"",
+                       filenames[i]);
+          return FALSE;
+        }
+    }
+
+  return TRUE;
+}
+
 static XdpOptionKey save_files_options[] = {
   { "accept_label", G_VARIANT_TYPE_STRING, NULL },
   { "modal", G_VARIANT_TYPE_BOOLEAN, NULL },
   { "current_name", G_VARIANT_TYPE_STRING, NULL },
   { "current_folder", G_VARIANT_TYPE_BYTESTRING, NULL },
-  { "files", G_VARIANT_TYPE_BYTESTRING_ARRAY, NULL },
+  { "files", G_VARIANT_TYPE_BYTESTRING_ARRAY, validate_files },
   { "choices", (const GVariantType *)"a(ssa(ss)s)", validate_choices  }
 };
 
@@ -803,6 +763,7 @@ save_files_done (GObject *source,
     g_object_set_data_full (G_OBJECT (request), "options", g_variant_ref (options), (GDestroyNotify)g_variant_unref);
 
   task = g_task_new (NULL, NULL, NULL, NULL);
+  g_task_set_source_tag (task, save_files_done);
   g_task_set_task_data (task, g_object_ref (request), g_object_unref);
   g_task_run_in_thread (task, send_response_in_thread_func);
 }
@@ -814,6 +775,8 @@ handle_save_files (XdpDbusFileChooser *object,
                    const gchar *arg_title,
                    GVariant *arg_options)
 {
+  FileChooser *file_chooser = (FileChooser *) object;
+  XdpDbusImplFileChooser *impl = file_chooser->impl;
   XdpRequest *request = xdp_request_from_invocation (invocation);
   const char *app_id = xdp_app_info_get_id (request->app_info);
   g_autoptr(GError) error = NULL;
@@ -821,7 +784,7 @@ handle_save_files (XdpDbusFileChooser *object,
   g_auto(GVariantBuilder) options =
     G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE_VARDICT);
 
-  if (xdp_dbus_impl_lockdown_get_disable_save_to_disk (lockdown))
+  if (xdp_dbus_impl_lockdown_get_disable_save_to_disk (file_chooser->lockdown_impl))
     {
       g_debug ("File saving disabled");
       g_dbus_method_invocation_return_error (invocation,
@@ -835,7 +798,7 @@ handle_save_files (XdpDbusFileChooser *object,
 
   if (!xdp_filter_options (arg_options, &options,
                            save_files_options, G_N_ELEMENTS (save_files_options),
-                           &error))
+                           NULL, &error))
     {
       g_dbus_method_invocation_return_gerror (invocation, error);
       return G_DBUS_METHOD_INVOCATION_HANDLED;
@@ -882,41 +845,79 @@ file_chooser_iface_init (XdpDbusFileChooserIface *iface)
 }
 
 static void
+file_chooser_dispose (GObject *object)
+{
+  FileChooser *fc = (FileChooser *) object;
+
+  g_clear_object (&fc->impl);
+  g_clear_object (&fc->lockdown_impl);
+
+  G_OBJECT_CLASS (file_chooser_parent_class)->dispose (object);
+}
+
+static void
 file_chooser_init (FileChooser *fc)
 {
-  xdp_dbus_file_chooser_set_version (XDP_DBUS_FILE_CHOOSER (fc), 4);
 }
 
 static void
 file_chooser_class_init (FileChooserClass *klass)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (klass);
+
+  object_class->dispose = file_chooser_dispose;
 }
 
-GDBusInterfaceSkeleton *
-file_chooser_create (GDBusConnection *connection,
-                     const char      *dbus_name,
-                     gpointer         lockdown_proxy)
+static FileChooser *
+file_chooser_new (XdpDbusImplFileChooser *impl,
+                  XdpDbusImplLockdown    *lockdown_impl)
 {
+  FileChooser *file_chooser;
+
+  file_chooser = g_object_new (file_chooser_get_type (), NULL);
+  file_chooser->impl = g_object_ref (impl);
+  file_chooser->lockdown_impl = g_object_ref (lockdown_impl);
+
+  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (file_chooser->impl), G_MAXINT);
+
+  xdp_dbus_file_chooser_set_version (XDP_DBUS_FILE_CHOOSER (file_chooser), 4);
+
+  return file_chooser;
+}
+
+void
+init_file_chooser (XdpContext *context)
+{
+  g_autoptr(FileChooser) file_chooser = NULL;
+  GDBusConnection *connection = xdp_context_get_connection (context);
+  XdpPortalConfig *config = xdp_context_get_config (context);
+  XdpImplConfig *impl_config;
+  g_autoptr(XdpDbusImplFileChooser) impl = NULL;
+  XdpDbusImplLockdown *lockdown_impl;
   g_autoptr(GError) error = NULL;
 
-  lockdown = lockdown_proxy;
+  impl_config = xdp_portal_config_find (config, FILE_CHOOSER_DBUS_IMPL_IFACE);
+  if (impl_config == NULL)
+    return;
 
   impl = xdp_dbus_impl_file_chooser_proxy_new_sync (connection,
                                                     G_DBUS_PROXY_FLAGS_NONE,
-                                                    dbus_name,
-                                                    DESKTOP_PORTAL_OBJECT_PATH,
+                                                    impl_config->dbus_name,
+                                                    DESKTOP_DBUS_PATH,
                                                     NULL,
                                                     &error);
 
   if (impl == NULL)
     {
       g_warning ("Failed to create file chooser proxy: %s", error->message);
-      return NULL;
+      return;
     }
 
-  g_dbus_proxy_set_default_timeout (G_DBUS_PROXY (impl), G_MAXINT);
+  lockdown_impl = xdp_context_get_lockdown_impl (context);
 
-  file_chooser = g_object_new (file_chooser_get_type (), NULL);
+  file_chooser = file_chooser_new (impl, lockdown_impl);
 
-  return G_DBUS_INTERFACE_SKELETON (file_chooser);
+  xdp_context_take_and_export_portal (context,
+                                      G_DBUS_INTERFACE_SKELETON (g_steal_pointer (&file_chooser)),
+                                      XDP_CONTEXT_EXPORT_FLAGS_NONE);
 }

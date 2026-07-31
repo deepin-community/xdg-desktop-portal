@@ -23,20 +23,23 @@
 
 #include "config.h"
 
-#include <errno.h>
+#include "xdp-documents.h"
 
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 
+#include "document-enums.h"
 #include "xdp-app-info.h"
 #include "xdp-dbus.h"
 #include "xdp-utils.h"
-#include "xdp-documents.h"
-#include "document-enums.h"
+
+#define DOCUMENT_PORTAL_DBUS_NAME "org.freedesktop.portal.Documents"
+#define DOCUMENT_PORTAL_DBUS_PATH "/org/freedesktop/portal/documents"
 
 static XdpDbusDocuments *documents = NULL;
 static char *documents_mountpoint = NULL;
@@ -48,8 +51,8 @@ xdp_init_document_proxy (GDBusConnection  *connection,
   g_autoptr(GError) local_error = NULL;
 
   documents = xdp_dbus_documents_proxy_new_sync (connection, 0,
-                                                 "org.freedesktop.portal.Documents",
-                                                 "/org/freedesktop/portal/documents",
+                                                 DOCUMENT_PORTAL_DBUS_NAME,
+                                                 DOCUMENT_PORTAL_DBUS_PATH,
                                                  NULL, error);
   if (!documents)
     return FALSE;
@@ -78,7 +81,7 @@ xdp_register_document (const char        *uri,
   g_autofree char *path = NULL;
   g_autofree char *basename = NULL;
   g_autofree char *dirname = NULL;
-  GUnixFDList *fd_list = NULL;
+  g_autoptr(GUnixFDList) fd_list = NULL;
   int fd, fd_in;
   g_autoptr(GFile) file = NULL;
   gboolean ret = FALSE;
@@ -93,13 +96,19 @@ xdp_register_document (const char        *uri,
 
   file = g_file_new_for_uri (uri);
   path = g_file_get_path (file);
+  if (path == NULL)
+    {
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
+                   "URI %s not supported by the document portal", uri);
+      return NULL;
+    }
   basename = g_path_get_basename (path);
   dirname = g_path_get_dirname (path);
 
   if (flags & XDP_DOCUMENT_FLAG_FOR_SAVE)
-    fd = open (dirname, O_PATH | O_CLOEXEC);
+    fd = open (dirname, O_CLOEXEC);
   else
-    fd = open (path, O_PATH | O_CLOEXEC);
+    fd = open (path, O_CLOEXEC);
 
   if (fd == -1)
     {
@@ -187,8 +196,6 @@ xdp_register_document (const char        *uri,
                                                 error);
     }
 
-  g_object_unref (fd_list);
-
   if (!ret)
     return NULL;
 
@@ -207,41 +214,14 @@ xdp_register_document (const char        *uri,
         return NULL;
     }
 
-  if (!g_strcmp0 (doc_id, ""))
+  if (g_strcmp0 (doc_id, "") == 0)
     {
       doc_path = g_build_filename (path, NULL);
-      return g_filename_to_uri (doc_path, NULL, NULL);
+      return g_filename_to_uri (doc_path, NULL, error);
     }
 
   doc_path = g_build_filename (documents_mountpoint, doc_id, basename, NULL);
-  return g_filename_to_uri (doc_path, NULL, NULL);
-}
-
-char *
-xdp_get_real_path_for_doc_path (const char *path,
-                                XdpAppInfo *app_info)
-{
-  g_autofree char *doc_id = NULL;
-  gboolean ret = FALSE;
-  g_autoptr(GError) error = NULL;
-
-  if (xdp_app_info_is_host (app_info))
-    return g_strdup (path);
-
-  ret = xdp_dbus_documents_call_lookup_sync (documents, path, &doc_id, NULL, &error);
-  if (!ret)
-    {
-      g_debug ("document portal error for path '%s': %s", path, error->message);
-      return g_strdup (path);
-    }
-
-  if (!g_strcmp0 (doc_id, ""))
-    {
-      g_debug ("document portal returned empty doc id for path '%s'", path);
-      return g_strdup (path);
-    }
-
-  return xdp_get_real_path_for_doc_id (doc_id);
+  return g_filename_to_uri (doc_path, NULL, error);
 }
 
 char *
@@ -259,4 +239,82 @@ xdp_get_real_path_for_doc_id (const char *doc_id)
     }
 
   return real_path;
+}
+
+/* Get the document id from the path, if there's any.
+ * Returns TRUE when path seems to point to the documents
+ * storage. Also returns the guessed doc id and suffix path
+ * without the dir name immediately following the doc id.
+ */
+static gboolean
+xdp_looks_like_document_portal_path (const char  *path,
+                                     char       **docid_out,
+                                     char       **suffix_path_out)
+{
+  g_autofree char *docid = NULL;
+  g_autofree char *suffix_path = NULL;
+  const char *p, *q;
+
+  if (!g_str_has_prefix (path, g_get_user_runtime_dir ()))
+    return FALSE;
+
+  p = strstr (path, "/doc/");
+  if (!p)
+    return FALSE;
+
+  p += strlen ("/doc/");
+  q = strchr (p, '/');
+
+  if (q)
+    {
+      docid = g_strndup (p, q - p);
+
+      /* The mapping from doc path to the host path already provides the dir name,
+       * so we can omit it from the subpath.
+       */
+      q = strchr (++q, '/');
+      if (q)
+        suffix_path = g_strdup (q);
+    }
+  else
+    {
+      docid = g_strdup (p);
+    }
+
+  if (docid[0] == '\0')
+    return FALSE;
+
+  if (docid_out)
+    *docid_out = g_steal_pointer (&docid);
+  if (suffix_path_out)
+    *suffix_path_out = g_steal_pointer (&suffix_path);
+  return TRUE;
+}
+
+char *
+xdp_resolve_document_portal_path (const char                 *path,
+                                  XdpResolveDocumentStrategy  strategy)
+{
+  g_autofree char *docid = NULL;
+  g_autofree char *suffix_path = NULL;
+  g_autofree char *host_path = NULL;
+  g_autofree char *resolved_path = NULL;
+
+  if (!xdp_looks_like_document_portal_path (path, &docid, &suffix_path))
+    return g_strdup (path);
+
+  host_path = xdp_get_real_path_for_doc_id (docid);
+  if (!host_path)
+    return g_strdup (path);
+
+  resolved_path = g_strconcat (host_path, suffix_path, NULL);
+
+  if (strategy == XDP_RESOLVE_DOCUMENT_TO_DIRECTORY)
+    {
+      char *last_dir_separator = strrchr (resolved_path, G_DIR_SEPARATOR);
+      if (last_dir_separator)
+        *last_dir_separator = '\0';
+    }
+
+  return g_steal_pointer (&resolved_path);
 }
